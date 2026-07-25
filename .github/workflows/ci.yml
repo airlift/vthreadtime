@@ -125,12 +125,74 @@ jobs:
       - name: Build
         run: ./mvnw clean install -B -V -P ci
 
+  native-build:
+    uses: ./.github/workflows/native-build.yml
+
+  universal-package:
+    needs: native-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install Java
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5
+        with:
+          distribution: temurin
+          java-version: 25
+          cache: maven
+
+      - name: Download native libraries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: native-*
+          path: ${{ runner.temp }}/native-resources
+          merge-multiple: true
+
+      - name: Build universal package
+        run: |
+          ./mvnw clean install -B -V -P ci \
+              -Dexec.skip=true \
+              -Dvthreadtime.native.resources="${RUNNER_TEMP}/native-resources/resources"
+
+      - name: Verify native libraries
+        run: |
+          main_jars=()
+          while IFS= read -r -d '' candidate; do
+            main_jars+=("$candidate")
+          done < <(find target -maxdepth 1 -type f -name '*.jar' \
+              ! -name '*-tests.jar' \
+              ! -name '*-sources.jar' \
+              ! -name '*-javadoc.jar' \
+              -print0)
+          if [[ "${#main_jars[@]}" -ne 1 ]]; then
+            echo "Expected one main JAR, found ${#main_jars[@]}" >&2
+            exit 1
+          fi
+          main_jar=${main_jars[0]}
+
+          jar tf "$main_jar" > "${RUNNER_TEMP}/jar-contents.txt"
+          for library in \
+              io/airlift/vthreadtime/native/linux-aarch64/libvthreadtime.so \
+              io/airlift/vthreadtime/native/linux-x86_64/libvthreadtime.so \
+              io/airlift/vthreadtime/native/macos-aarch64/libvthreadtime.dylib \
+              io/airlift/vthreadtime/native/macos-x86_64/libvthreadtime.dylib; do
+            if ! grep -qFx "$library" "${RUNNER_TEMP}/jar-contents.txt"; then
+              echo "Missing native library in $main_jar: $library" >&2
+              exit 1
+            fi
+          done
+
   ci-success:
     if: always()
     needs:
       - check-commits-dispatcher
       - check-commit
       - java-compatibility
+      - native-build
+      - universal-package
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -139,10 +201,14 @@ jobs:
           CHECK_COMMIT_RESULT: ${{ needs.check-commit.result }}
           DISPATCHER_RESULT: ${{ needs.check-commits-dispatcher.result }}
           JAVA_COMPATIBILITY_RESULT: ${{ needs.java-compatibility.result }}
+          NATIVE_BUILD_RESULT: ${{ needs.native-build.result }}
+          UNIVERSAL_PACKAGE_RESULT: ${{ needs.universal-package.result }}
         run: |
           if [[ "$JAVA_COMPATIBILITY_RESULT" != success ]] ||
+              [[ "$NATIVE_BUILD_RESULT" != success ]] ||
+              [[ "$UNIVERSAL_PACKAGE_RESULT" != success ]] ||
               [[ "$CHECK_COMMIT_RESULT" == failure || "$CHECK_COMMIT_RESULT" == cancelled ]] ||
               [[ "$DISPATCHER_RESULT" == failure || "$DISPATCHER_RESULT" == cancelled ]]; then
-            echo "CI failed: java=$JAVA_COMPATIBILITY_RESULT check-commit=$CHECK_COMMIT_RESULT dispatcher=$DISPATCHER_RESULT" >&2
+            echo "CI failed: java=$JAVA_COMPATIBILITY_RESULT native=$NATIVE_BUILD_RESULT package=$UNIVERSAL_PACKAGE_RESULT check-commit=$CHECK_COMMIT_RESULT dispatcher=$DISPATCHER_RESULT" >&2
             exit 1
           fi

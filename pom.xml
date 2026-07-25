@@ -37,7 +37,9 @@
         <air.compiler.fail-warnings>true</air.compiler.fail-warnings>
         <air.check.skip-pmd>true</air.check.skip-pmd>
         <air.javadoc.lint>all,-missing</air.javadoc.lint>
+        <air.test.jvm.additional-arguments>--enable-native-access=io.airlift.vthreadtime --illegal-native-access=deny</air.test.jvm.additional-arguments>
         <project.build.targetJdk>25</project.build.targetJdk>
+        <vthreadtime.native.resources>${project.build.directory}/generated-native-resources</vthreadtime.native.resources>
     </properties>
 
     <dependencies>
@@ -58,22 +60,58 @@
             <artifactId>junit-jupiter-engine</artifactId>
             <scope>test</scope>
         </dependency>
+
     </dependencies>
 
     <build>
+        <resources>
+            <resource>
+                <directory>src/main/resources</directory>
+            </resource>
+            <resource>
+                <directory>${vthreadtime.native.resources}</directory>
+            </resource>
+        </resources>
         <plugins>
             <plugin>
-                <artifactId>maven-jar-plugin</artifactId>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>exec-maven-plugin</artifactId>
+                <version>3.6.3</version>
                 <configuration>
-                    <!-- The initial project scaffold intentionally has no classes. -->
-                    <skipIfEmpty>false</skipIfEmpty>
+                    <executable>${project.basedir}/src/main/c/build-native.sh</executable>
+                    <arguments>
+                        <argument>${vthreadtime.native.resources}</argument>
+                    </arguments>
                 </configuration>
+                <executions>
+                    <execution>
+                        <id>build-native-library</id>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <phase>generate-resources</phase>
+                    </execution>
+                </executions>
             </plugin>
             <plugin>
-                <artifactId>maven-surefire-plugin</artifactId>
+                <artifactId>maven-compiler-plugin</artifactId>
                 <configuration>
-                    <!-- The initial project scaffold intentionally has no tests. -->
-                    <failIfNoTests>false</failIfNoTests>
+                    <compilerArgs>
+                        <arg>-Xlint:all,-classfile,-processing,-restricted,-serial</arg>
+                        <arg>-XDcompilePolicy=simple</arg>
+                        <arg>--should-stop=ifError=FLOW</arg>
+                        <arg>-Xplugin:ErrorProne \
+                            @${air.main.basedir}/.mvn/errorprone.config \
+                            -XepExcludedPaths:.*/target/generated-test-sources/test-annotations/.*</arg>
+                    </compilerArgs>
+                    <proc>full</proc>
+                    <annotationProcessorPaths>
+                        <path>
+                            <groupId>com.google.errorprone</groupId>
+                            <artifactId>error_prone_core</artifactId>
+                            <version>${dep.errorprone.version}</version>
+                        </path>
+                    </annotationProcessorPaths>
                 </configuration>
             </plugin>
         </plugins>
