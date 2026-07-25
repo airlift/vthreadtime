@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>io.airlift</groupId>
+        <artifactId>airbase</artifactId>
+        <version>394</version>
+    </parent>
+
+    <artifactId>vthreadtime</artifactId>
+    <version>1.0-SNAPSHOT</version>
+    <packaging>jar</packaging>
+
+    <name>Virtual Thread Time</name>
+    <description>Measure virtual thread mounted time and scheduling activity on the JVM</description>
+    <url>https://github.com/airlift/vthreadtime</url>
+
+    <inceptionYear>2026</inceptionYear>
+
+    <licenses>
+        <license>
+            <name>Apache License 2.0</name>
+            <url>https://www.apache.org/licenses/LICENSE-2.0.html</url>
+            <distribution>repo</distribution>
+        </license>
+    </licenses>
+
+    <scm>
+        <connection>scm:git:https://github.com/airlift/vthreadtime.git</connection>
+        <developerConnection>scm:git:git@github.com:airlift/vthreadtime.git</developerConnection>
+        <tag>HEAD</tag>
+        <url>https://github.com/airlift/vthreadtime</url>
+    </scm>
+
+    <properties>
+        <air.compiler.fail-warnings>true</air.compiler.fail-warnings>
+        <air.check.skip-pmd>true</air.check.skip-pmd>
+        <air.javadoc.lint>all,-missing</air.javadoc.lint>
+        <project.build.targetJdk>25</project.build.targetJdk>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.assertj</groupId>
+            <artifactId>assertj-core</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter-api</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter-engine</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <artifactId>maven-jar-plugin</artifactId>
+                <configuration>
+                    <!-- The initial project scaffold intentionally has no classes. -->
+                    <skipIfEmpty>false</skipIfEmpty>
+                </configuration>
+            </plugin>
+            <plugin>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <!-- The initial project scaffold intentionally has no tests. -->
+                    <failIfNoTests>false</failIfNoTests>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>

@@ -1,0 +1,101 @@
+name: Release snapshot version
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Branch to release
+        required: true
+        default: main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: maven-publication
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  resolve-source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      commit: ${{ steps.resolve.outputs.commit }}
+    steps:
+      - name: Checkout requested branch
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 1
+          ref: ${{ inputs.branch }}
+          persist-credentials: false
+
+      - name: Resolve source commit
+        id: resolve
+        run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  snapshot-release:
+    needs: resolve-source
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.resolve-source.outputs.commit }}
+          persist-credentials: false
+
+      - name: Verify source commit
+        env:
+          EXPECTED_COMMIT: ${{ needs.resolve-source.outputs.commit }}
+        run: |
+          actual_commit=$(git rev-parse HEAD)
+          if [[ "$actual_commit" != "$EXPECTED_COMMIT" ]]; then
+            echo "Checked out $actual_commit instead of $EXPECTED_COMMIT" >&2
+            exit 1
+          fi
+
+      - name: Install Java
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5
+        with:
+          java-version: 25
+          distribution: temurin
+          gpg-private-key: ${{ secrets.JRELEASER_GPG_SECRET_KEY }}
+          gpg-passphrase: MAVEN_GPG_PASSPHRASE
+          cache: maven
+
+      - name: Verify snapshot configuration
+        env:
+          MAVENCENTRAL_USERNAME: ${{ secrets.JRELEASER_NEXUS2_MAVEN_CENTRAL_USERNAME }}
+          MAVENCENTRAL_PASSWORD: ${{ secrets.JRELEASER_NEXUS2_MAVEN_CENTRAL_TOKEN }}
+        run: |
+          ./mvnw -B njord:status | tee "${RUNNER_TEMP}/njord-status.log"
+          grep -F "Repository Auth: Present" "${RUNNER_TEMP}/njord-status.log"
+          grep -F "POM URL: https://central.sonatype.com/repository/maven-snapshots/" "${RUNNER_TEMP}/njord-status.log"
+
+      - name: Stage snapshot
+        env:
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.JRELEASER_GPG_PASSPHRASE }}
+        run: ./mvnw clean deploy -DskipTests -Poss-release -DaltDeploymentRepository=id::njord:snapshot
+
+      - name: Validate snapshot
+        env:
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.JRELEASER_GPG_PASSPHRASE }}
+          MAVENCENTRAL_USERNAME: ${{ secrets.JRELEASER_NEXUS2_MAVEN_CENTRAL_USERNAME }}
+          MAVENCENTRAL_PASSWORD: ${{ secrets.JRELEASER_NEXUS2_MAVEN_CENTRAL_TOKEN }}
+        run: |
+          ./mvnw njord:list
+          ./mvnw njord:status
+          ./mvnw njord:validate
+
+      - name: Publish snapshot
+        env:
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.JRELEASER_GPG_PASSPHRASE }}
+          MAVENCENTRAL_USERNAME: ${{ secrets.JRELEASER_NEXUS2_MAVEN_CENTRAL_USERNAME }}
+          MAVENCENTRAL_PASSWORD: ${{ secrets.JRELEASER_NEXUS2_MAVEN_CENTRAL_TOKEN }}
+        run: ./mvnw njord:publish -Poss-release
