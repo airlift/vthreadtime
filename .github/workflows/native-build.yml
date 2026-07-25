@@ -1,0 +1,101 @@
+name: Native build
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Full commit SHA to build
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: ${{ matrix.native-id }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - native-id: linux-x86_64
+            runner: ubuntu-24.04
+          - native-id: linux-aarch64
+            runner: ubuntu-24.04-arm
+          - native-id: macos-aarch64
+            runner: macos-15
+          - native-id: macos-x86_64
+            runner: macos-15-intel
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Install Java
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5
+        with:
+          distribution: temurin
+          java-version: 25
+          cache: maven
+
+      - name: Build
+        run: ./mvnw clean install -B -V -P ci
+
+      - name: Prepare native artifact
+        env:
+          EXPECTED_COMMIT: ${{ inputs.ref }}
+          NATIVE_ID: ${{ matrix.native-id }}
+        run: |
+          actual_commit=$(git rev-parse HEAD)
+          if [[ -n "$EXPECTED_COMMIT" ]]; then
+            if [[ ! "$EXPECTED_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "Expected commit is not a full SHA: $EXPECTED_COMMIT" >&2
+              exit 1
+            fi
+            if [[ "$actual_commit" != "$EXPECTED_COMMIT" ]]; then
+              echo "Checked out $actual_commit instead of $EXPECTED_COMMIT" >&2
+              exit 1
+            fi
+          fi
+
+          library_count=$(find target/generated-native-resources -type f | wc -l | tr -d ' ')
+          if [[ "$library_count" != 1 ]]; then
+            echo "Expected one native library, found $library_count" >&2
+            exit 1
+          fi
+          library=$(find target/generated-native-resources -type f)
+          relative_path=${library#target/generated-native-resources/}
+          digest=$(shasum -a 256 "$library" | awk '{print $1}')
+          if [[ "$NATIVE_ID" == macos-* ]]; then
+            minimum_macos=$(otool -l "$library" |
+              awk '/LC_BUILD_VERSION/ { build_version = 1 } build_version && $1 == "minos" { print $2; exit }')
+            if [[ "$minimum_macos" != 15.0 ]]; then
+              echo "Expected macOS deployment target 15.0, found $minimum_macos" >&2
+              exit 1
+            fi
+          fi
+
+          mkdir -p target/native-artifact/resources target/native-artifact/provenance
+          cp -R target/generated-native-resources/. target/native-artifact/resources/
+          jq -n \
+              --arg commit "$actual_commit" \
+              --arg platform "$NATIVE_ID" \
+              --arg path "$relative_path" \
+              --arg sha256 "$digest" \
+              '{commit: $commit, platform: $platform, path: $path, sha256: $sha256}' \
+              > "target/native-artifact/provenance/${NATIVE_ID}.json"
+
+      - name: Upload native library
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-${{ matrix.native-id }}
+          path: target/native-artifact
+          if-no-files-found: error

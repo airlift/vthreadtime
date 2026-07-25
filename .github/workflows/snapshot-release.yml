@@ -37,8 +37,16 @@ jobs:
         id: resolve
         run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-  snapshot-release:
+  native-build:
     needs: resolve-source
+    uses: ./.github/workflows/native-build.yml
+    with:
+      ref: ${{ needs.resolve-source.outputs.commit }}
+
+  snapshot-release:
+    needs:
+      - resolve-source
+      - native-build
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -69,6 +77,81 @@ jobs:
           gpg-passphrase: MAVEN_GPG_PASSPHRASE
           cache: maven
 
+      - name: Download native libraries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: native-*
+          path: ${{ runner.temp }}/native-resources
+          merge-multiple: true
+
+      - name: Verify native libraries
+        env:
+          EXPECTED_COMMIT: ${{ needs.resolve-source.outputs.commit }}
+          NATIVE_RESOURCES: ${{ runner.temp }}/native-resources
+        run: |
+          platforms=(linux-x86_64 linux-aarch64 macos-x86_64 macos-aarch64)
+          for platform in "${platforms[@]}"; do
+            metadata="${NATIVE_RESOURCES}/provenance/${platform}.json"
+            if [[ ! -f "$metadata" ]]; then
+              echo "Missing provenance for $platform" >&2
+              exit 1
+            fi
+
+            commit=$(jq -er '.commit' "$metadata")
+            recorded_platform=$(jq -er '.platform' "$metadata")
+            relative_path=$(jq -er '.path' "$metadata")
+            expected_digest=$(jq -er '.sha256' "$metadata")
+            if [[ "$commit" != "$EXPECTED_COMMIT" ]]; then
+              echo "$platform was built from $commit instead of $EXPECTED_COMMIT" >&2
+              exit 1
+            fi
+            if [[ "$recorded_platform" != "$platform" ]]; then
+              echo "$metadata identifies platform $recorded_platform instead of $platform" >&2
+              exit 1
+            fi
+
+            case "$platform" in
+              linux-x86_64)
+                expected_path=io/airlift/vthreadtime/native/linux-x86_64/libvthreadtime.so
+                ;;
+              linux-aarch64)
+                expected_path=io/airlift/vthreadtime/native/linux-aarch64/libvthreadtime.so
+                ;;
+              macos-x86_64)
+                expected_path=io/airlift/vthreadtime/native/macos-x86_64/libvthreadtime.dylib
+                ;;
+              macos-aarch64)
+                expected_path=io/airlift/vthreadtime/native/macos-aarch64/libvthreadtime.dylib
+                ;;
+              *)
+                echo "Unknown platform: $platform" >&2
+                exit 1
+                ;;
+            esac
+            if [[ "$relative_path" != "$expected_path" ]]; then
+              echo "$platform recorded unexpected library path $relative_path" >&2
+              exit 1
+            fi
+
+            library="${NATIVE_RESOURCES}/resources/${relative_path}"
+            if [[ ! -f "$library" ]]; then
+              echo "Missing native library for $platform: $relative_path" >&2
+              exit 1
+            fi
+            actual_digest=$(sha256sum "$library" | awk '{print $1}')
+            if [[ "$actual_digest" != "$expected_digest" ]]; then
+              echo "Digest mismatch for $platform" >&2
+              exit 1
+            fi
+          done
+
+          metadata_count=$(find "${NATIVE_RESOURCES}/provenance" -type f -name '*.json' | wc -l)
+          library_count=$(find "${NATIVE_RESOURCES}/resources" -type f | wc -l)
+          if [[ "$metadata_count" -ne 4 || "$library_count" -ne 4 ]]; then
+            echo "Expected four metadata files and four native libraries; found $metadata_count and $library_count" >&2
+            exit 1
+          fi
+
       - name: Verify snapshot configuration
         env:
           MAVENCENTRAL_USERNAME: ${{ secrets.JRELEASER_NEXUS2_MAVEN_CENTRAL_USERNAME }}
@@ -81,7 +164,39 @@ jobs:
       - name: Stage snapshot
         env:
           MAVEN_GPG_PASSPHRASE: ${{ secrets.JRELEASER_GPG_PASSPHRASE }}
-        run: ./mvnw clean deploy -DskipTests -Poss-release -DaltDeploymentRepository=id::njord:snapshot
+        run: |
+          ./mvnw clean deploy -DskipTests -Poss-release \
+              -DaltDeploymentRepository=id::njord:snapshot \
+              -Dexec.skip=true \
+              -Dvthreadtime.native.resources="${RUNNER_TEMP}/native-resources/resources"
+
+      - name: Verify staged snapshot
+        env:
+          NATIVE_RESOURCES: ${{ runner.temp }}/native-resources
+        run: |
+          main_jars=()
+          while IFS= read -r -d '' candidate; do
+            main_jars+=("$candidate")
+          done < <(find target -maxdepth 1 -type f -name '*.jar' \
+              ! -name '*-tests.jar' \
+              ! -name '*-sources.jar' \
+              ! -name '*-javadoc.jar' \
+              -print0)
+          if [[ "${#main_jars[@]}" -ne 1 ]]; then
+            echo "Expected one main JAR, found ${#main_jars[@]}" >&2
+            exit 1
+          fi
+          snapshot_jar=${main_jars[0]}
+
+          for metadata in "${NATIVE_RESOURCES}"/provenance/*.json; do
+            relative_path=$(jq -er '.path' "$metadata")
+            expected_digest=$(jq -er '.sha256' "$metadata")
+            actual_digest=$(unzip -p "$snapshot_jar" "$relative_path" | sha256sum | awk '{print $1}')
+            if [[ "$actual_digest" != "$expected_digest" ]]; then
+              echo "Packaged digest mismatch for $relative_path" >&2
+              exit 1
+            fi
+          done
 
       - name: Validate snapshot
         env:
