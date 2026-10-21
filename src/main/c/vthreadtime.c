@@ -13,6 +13,10 @@
  */
 
 #define _POSIX_C_SOURCE 200809L
+#if defined(__APPLE__)
+// Exposes CLOCK_UPTIME_RAW.
+#define _DARWIN_C_SOURCE
+#endif
 
 #include <jni.h>
 #include <jvmti.h>
@@ -21,6 +25,7 @@
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -57,6 +62,15 @@ typedef struct
     bool mounted;
     bool mountStartedValid;
 } ThreadState;
+
+// NativeAccess reads this struct directly through a memory segment; keep both layouts in sync.
+_Static_assert(offsetof(ThreadState, mountedNanos) == 0, "ThreadState layout");
+_Static_assert(offsetof(ThreadState, mountStarted) == 8, "ThreadState layout");
+_Static_assert(offsetof(ThreadState, mountCount) == 16, "ThreadState layout");
+_Static_assert(offsetof(ThreadState, unmountCount) == 24, "ThreadState layout");
+_Static_assert(offsetof(ThreadState, mounted) == 32, "ThreadState layout");
+_Static_assert(offsetof(ThreadState, mountStartedValid) == 33, "ThreadState layout");
+_Static_assert(sizeof(ThreadState) == 40, "ThreadState layout");
 
 static JavaVM* javaVm = NULL;
 static jvmtiEnv* jvmti = NULL;
@@ -101,10 +115,18 @@ static bool injectInitializationFault(const char* point)
 }
 #endif
 
+// Java reads mounted time directly from the thread state and must observe the clock behind
+// System.nanoTime(): CLOCK_MONOTONIC on Linux, CLOCK_UPTIME_RAW on macOS.
+#if defined(__APPLE__)
+#define VTHREADTIME_CLOCK CLOCK_UPTIME_RAW
+#else
+#define VTHREADTIME_CLOCK CLOCK_MONOTONIC
+#endif
+
 static bool monotonicTime(uint64_t* result)
 {
     struct timespec value = {0};
-    if (clock_gettime(CLOCK_MONOTONIC, &value) != 0) {
+    if (clock_gettime(VTHREADTIME_CLOCK, &value) != 0) {
         return false;
     }
     *result = ((uint64_t) value.tv_sec * 1000000000ULL) + (uint64_t) value.tv_nsec;
@@ -482,36 +504,9 @@ VTHREADTIME_EXPORT int airlift_vthreadtime_register(void)
     return registerCurrentThread();
 }
 
-VTHREADTIME_EXPORT int64_t airlift_vthreadtime_mounted_nanos(void)
+VTHREADTIME_EXPORT int64_t airlift_vthreadtime_state_address(void)
 {
-    ThreadState* state = currentState;
-    if (state == NULL) {
-        return -NOT_REGISTERED;
-    }
-    uint64_t mountedNanos = state->mountedNanos;
-    uint64_t now;
-    if (state->mounted && state->mountStartedValid && monotonicTime(&now) && now >= state->mountStarted) {
-        mountedNanos += now - state->mountStarted;
-    }
-    return (int64_t) mountedNanos;
-}
-
-VTHREADTIME_EXPORT int64_t airlift_vthreadtime_mount_count(void)
-{
-    ThreadState* state = currentState;
-    if (state == NULL) {
-        return -NOT_REGISTERED;
-    }
-    return (int64_t) state->mountCount;
-}
-
-VTHREADTIME_EXPORT int64_t airlift_vthreadtime_unmount_count(void)
-{
-    ThreadState* state = currentState;
-    if (state == NULL) {
-        return -NOT_REGISTERED;
-    }
-    return (int64_t) state->unmountCount;
+    return (int64_t) (intptr_t) currentState;
 }
 
 VTHREADTIME_EXPORT int airlift_vthreadtime_unregister(void)

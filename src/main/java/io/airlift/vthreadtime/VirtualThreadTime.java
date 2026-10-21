@@ -13,6 +13,8 @@
  */
 package io.airlift.vthreadtime;
 
+import java.lang.foreign.MemorySegment;
+
 /// Measures the time a virtual thread is mounted on carrier threads.
 ///
 /// A tracker is bound to the virtual thread that registers it. All methods,
@@ -21,11 +23,13 @@ public final class VirtualThreadTime
         implements AutoCloseable
 {
     private final Thread owner;
+    private final MemorySegment state;
     private boolean closed;
 
-    private VirtualThreadTime(Thread owner)
+    private VirtualThreadTime(Thread owner, MemorySegment state)
     {
         this.owner = owner;
+        this.state = state;
     }
 
     /// Returns whether the current JVM and platform support mounted-time tracking.
@@ -50,15 +54,14 @@ public final class VirtualThreadTime
         if (!thread.isVirtual()) {
             throw new IllegalStateException("Current thread is not virtual");
         }
-        NativeAccess.register();
-        return new VirtualThreadTime(thread);
+        return new VirtualThreadTime(thread, NativeAccess.register());
     }
 
     /// Returns cumulative mounted time since registration, in nanoseconds.
     public long mountedTimeNanos()
     {
         checkOwner();
-        return NativeAccess.mountedNanos();
+        return NativeAccess.mountedNanos(state);
     }
 
     /// Returns the number of mounted intervals since registration.
@@ -66,14 +69,14 @@ public final class VirtualThreadTime
     public long mountCount()
     {
         checkOwner();
-        return NativeAccess.mountCount();
+        return NativeAccess.mountCount(state);
     }
 
     /// Returns the number of unmounts since registration.
     public long unmountCount()
     {
         checkOwner();
-        return NativeAccess.unmountCount();
+        return NativeAccess.unmountCount(state);
     }
 
     /// Unregisters the current virtual thread.
