@@ -19,6 +19,7 @@ import java.lang.foreign.SymbolLookup;
 import java.lang.invoke.MethodHandle;
 
 import static java.lang.Math.toIntExact;
+import static java.lang.foreign.Linker.Option.critical;
 import static java.lang.foreign.ValueLayout.JAVA_INT;
 import static java.lang.foreign.ValueLayout.JAVA_LONG;
 
@@ -52,13 +53,16 @@ final class NativeAccess
                     FunctionDescriptor.of(JAVA_INT));
             mountedNanos = linker.downcallHandle(
                     symbols.findOrThrow("airlift_vthreadtime_mounted_nanos"),
-                    FunctionDescriptor.of(JAVA_LONG));
+                    FunctionDescriptor.of(JAVA_LONG),
+                    critical(false));
             mountCount = linker.downcallHandle(
                     symbols.findOrThrow("airlift_vthreadtime_mount_count"),
-                    FunctionDescriptor.of(JAVA_LONG));
+                    FunctionDescriptor.of(JAVA_LONG),
+                    critical(false));
             unmountCount = linker.downcallHandle(
                     symbols.findOrThrow("airlift_vthreadtime_unmount_count"),
-                    FunctionDescriptor.of(JAVA_LONG));
+                    FunctionDescriptor.of(JAVA_LONG),
+                    critical(false));
             unregister = linker.downcallHandle(
                     symbols.findOrThrow("airlift_vthreadtime_unregister"),
                     FunctionDescriptor.of(JAVA_INT));
