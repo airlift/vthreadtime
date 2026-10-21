@@ -15,29 +15,35 @@ package io.airlift.vthreadtime;
 
 import java.lang.foreign.FunctionDescriptor;
 import java.lang.foreign.Linker;
+import java.lang.foreign.MemorySegment;
 import java.lang.foreign.SymbolLookup;
 import java.lang.invoke.MethodHandle;
 
-import static java.lang.Math.toIntExact;
 import static java.lang.foreign.Linker.Option.critical;
+import static java.lang.foreign.ValueLayout.JAVA_BYTE;
 import static java.lang.foreign.ValueLayout.JAVA_INT;
 import static java.lang.foreign.ValueLayout.JAVA_LONG;
 
 final class NativeAccess
 {
+    // Layout of ThreadState in vthreadtime.c
+    private static final long MOUNTED_NANOS_OFFSET = 0;
+    private static final long MOUNT_STARTED_OFFSET = 8;
+    private static final long MOUNT_COUNT_OFFSET = 16;
+    private static final long UNMOUNT_COUNT_OFFSET = 24;
+    private static final long MOUNTED_OFFSET = 32;
+    private static final long MOUNT_STARTED_VALID_OFFSET = 33;
+    private static final long STATE_SIZE = 40;
+
     private static final MethodHandle REGISTER;
-    private static final MethodHandle MOUNTED_NANOS;
-    private static final MethodHandle MOUNT_COUNT;
-    private static final MethodHandle UNMOUNT_COUNT;
+    private static final MethodHandle STATE_ADDRESS;
     private static final MethodHandle UNREGISTER;
     private static final MethodHandle ACTIVE_REGISTRATIONS;
     private static final Throwable INITIALIZATION_FAILURE;
 
     static {
         MethodHandle register = null;
-        MethodHandle mountedNanos = null;
-        MethodHandle mountCount = null;
-        MethodHandle unmountCount = null;
+        MethodHandle stateAddress = null;
         MethodHandle unregister = null;
         MethodHandle activeRegistrations = null;
         Throwable initializationFailure = null;
@@ -51,16 +57,8 @@ final class NativeAccess
             register = linker.downcallHandle(
                     symbols.findOrThrow("airlift_vthreadtime_register"),
                     FunctionDescriptor.of(JAVA_INT));
-            mountedNanos = linker.downcallHandle(
-                    symbols.findOrThrow("airlift_vthreadtime_mounted_nanos"),
-                    FunctionDescriptor.of(JAVA_LONG),
-                    critical(false));
-            mountCount = linker.downcallHandle(
-                    symbols.findOrThrow("airlift_vthreadtime_mount_count"),
-                    FunctionDescriptor.of(JAVA_LONG),
-                    critical(false));
-            unmountCount = linker.downcallHandle(
-                    symbols.findOrThrow("airlift_vthreadtime_unmount_count"),
+            stateAddress = linker.downcallHandle(
+                    symbols.findOrThrow("airlift_vthreadtime_state_address"),
                     FunctionDescriptor.of(JAVA_LONG),
                     critical(false));
             unregister = linker.downcallHandle(
@@ -79,9 +77,7 @@ final class NativeAccess
             initializationFailure = throwable;
         }
         REGISTER = register;
-        MOUNTED_NANOS = mountedNanos;
-        MOUNT_COUNT = mountCount;
-        UNMOUNT_COUNT = unmountCount;
+        STATE_ADDRESS = stateAddress;
         UNREGISTER = unregister;
         ACTIVE_REGISTRATIONS = activeRegistrations;
         INITIALIZATION_FAILURE = initializationFailure;
@@ -101,24 +97,39 @@ final class NativeAccess
         }
     }
 
-    static void register()
+    /// Registers the current thread and returns its native state. The segment is valid until
+    /// the thread is unregistered or terminates and must only be read by that thread.
+    static MemorySegment register()
     {
         checkStatus(invokeInt(REGISTER), "register");
+        long address = invokeLong(STATE_ADDRESS);
+        if (address == 0) {
+            throw new IllegalStateException("Could not register: native state is unavailable");
+        }
+        return MemorySegment.ofAddress(address).reinterpret(STATE_SIZE);
     }
 
-    static long mountedNanos()
+    /// Mounted time uses the clock behind [System#nanoTime()]; the thread is mounted while it runs.
+    static long mountedNanos(MemorySegment state)
     {
-        return checkValue(invokeLong(MOUNTED_NANOS), "read mounted time");
+        long mountedNanos = state.get(JAVA_LONG, MOUNTED_NANOS_OFFSET);
+        if (state.get(JAVA_BYTE, MOUNTED_OFFSET) != 0 && state.get(JAVA_BYTE, MOUNT_STARTED_VALID_OFFSET) != 0) {
+            long elapsed = System.nanoTime() - state.get(JAVA_LONG, MOUNT_STARTED_OFFSET);
+            if (elapsed >= 0) {
+                mountedNanos += elapsed;
+            }
+        }
+        return mountedNanos;
     }
 
-    static long mountCount()
+    static long mountCount(MemorySegment state)
     {
-        return checkValue(invokeLong(MOUNT_COUNT), "read mount count");
+        return state.get(JAVA_LONG, MOUNT_COUNT_OFFSET);
     }
 
-    static long unmountCount()
+    static long unmountCount(MemorySegment state)
     {
-        return checkValue(invokeLong(UNMOUNT_COUNT), "read unmount count");
+        return state.get(JAVA_LONG, UNMOUNT_COUNT_OFFSET);
     }
 
     static void unregister()
@@ -159,14 +170,6 @@ final class NativeAccess
         if (status != 0) {
             throw new IllegalStateException("Could not %s: %s".formatted(operation, statusMessage(status)));
         }
-    }
-
-    private static long checkValue(long value, String operation)
-    {
-        if (value < 0) {
-            throw new IllegalStateException("Could not %s: %s".formatted(operation, statusMessage(toIntExact(-value))));
-        }
-        return value;
     }
 
     private static String statusMessage(int status)
