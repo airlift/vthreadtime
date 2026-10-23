@@ -22,7 +22,6 @@
 #include <jvmti.h>
 
 #include <pthread.h>
-#include <stdarg.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -72,7 +71,6 @@ _Static_assert(offsetof(ThreadState, mounted) == 32, "ThreadState layout");
 _Static_assert(offsetof(ThreadState, mountStartedValid) == 33, "ThreadState layout");
 _Static_assert(sizeof(ThreadState) == 40, "ThreadState layout");
 
-static JavaVM* javaVm = NULL;
 static jvmtiEnv* jvmti = NULL;
 static _Atomic bool initialized = false;
 static pthread_mutex_t initializationMutex = PTHREAD_MUTEX_INITIALIZER;
@@ -133,23 +131,27 @@ static bool monotonicTime(uint64_t* result)
     return true;
 }
 
-static jvmtiError getState(jvmtiEnv* jvmti, jthread thread, ThreadState** state)
+// Thread-local storage is only ever accessed for the current thread. Passing NULL takes the
+// HotSpot fast path, which avoids the VM transition, the VTMS transition disabler and the
+// thread-list handle that resolving a jthread requires. Inside the mount and thread-end
+// callbacks the current thread is the virtual thread the event is about.
+static jvmtiError getState(jvmtiEnv* jvmti, ThreadState** state)
 {
     *state = NULL;
     void* value = NULL;
-    jvmtiError error = (*jvmti)->GetThreadLocalStorage(jvmti, thread, &value);
+    jvmtiError error = (*jvmti)->GetThreadLocalStorage(jvmti, NULL, &value);
     if (error == JVMTI_ERROR_NONE) {
         *state = (ThreadState*) value;
     }
     return error;
 }
 
-static jvmtiError clearState(jvmtiEnv* jvmti, jthread thread, ThreadState* state)
+static jvmtiError clearState(jvmtiEnv* jvmti, ThreadState* state)
 {
     if (state == NULL) {
         return JVMTI_ERROR_NONE;
     }
-    jvmtiError error = (*jvmti)->SetThreadLocalStorage(jvmti, thread, NULL);
+    jvmtiError error = (*jvmti)->SetThreadLocalStorage(jvmti, NULL, NULL);
     if (error != JVMTI_ERROR_NONE) {
         return error;
     }
@@ -166,15 +168,9 @@ static void JNICALL onMount(jvmtiEnv* jvmti, ...)
 #if defined(VTHREADTIME_TEST_INITIALIZATION_FAULTS)
     atomic_fetch_add_explicit(&testCallbackCount, 1, memory_order_relaxed);
 #endif
-    va_list arguments;
-    va_start(arguments, jvmti);
-    (void) va_arg(arguments, JNIEnv*);
-    jthread thread = va_arg(arguments, jthread);
-    va_end(arguments);
-
     currentState = NULL;
     ThreadState* state;
-    if (getState(jvmti, thread, &state) != JVMTI_ERROR_NONE) {
+    if (getState(jvmti, &state) != JVMTI_ERROR_NONE) {
         return;
     }
     currentState = state;
@@ -192,11 +188,6 @@ static void JNICALL onUnmount(jvmtiEnv* jvmti, ...)
 #if defined(VTHREADTIME_TEST_INITIALIZATION_FAULTS)
     atomic_fetch_add_explicit(&testCallbackCount, 1, memory_order_relaxed);
 #endif
-    va_list arguments;
-    va_start(arguments, jvmti);
-    (void) va_arg(arguments, JNIEnv*);
-    (void) va_arg(arguments, jthread);
-    va_end(arguments);
     (void) jvmti;
 
     ThreadState* state = currentState;
@@ -220,9 +211,10 @@ static void JNICALL onVirtualThreadEnd(jvmtiEnv* jvmti, JNIEnv* jni, jthread thr
     atomic_fetch_add_explicit(&testCallbackCount, 1, memory_order_relaxed);
 #endif
     (void) jni;
+    (void) thread;
     ThreadState* state;
-    if (getState(jvmti, thread, &state) == JVMTI_ERROR_NONE) {
-        (void) clearState(jvmti, thread, state);
+    if (getState(jvmti, &state) == JVMTI_ERROR_NONE) {
+        (void) clearState(jvmti, state);
     }
 }
 
@@ -397,7 +389,6 @@ static int initializeLocked(void)
         return failInitialization(jvmti, mountIndex, unmountIndex, EVENT_ENABLE_FAILED);
     }
 
-    javaVm = vm;
     atomic_store_explicit(&initialized, true, memory_order_release);
     return SUCCESS;
 }
@@ -410,41 +401,23 @@ static int initialize(void)
     return status;
 }
 
-static void deleteLocalReference(jthread thread)
-{
-    JNIEnv* jni = NULL;
-    if (thread != NULL &&
-            (*javaVm)->GetEnv(javaVm, (void**) &jni, JNI_VERSION_10) == JNI_OK &&
-            jni != NULL) {
-        (*jni)->DeleteLocalRef(jni, thread);
-    }
-}
-
 static int registerCurrentThread(void)
 {
     if (!atomic_load_explicit(&initialized, memory_order_acquire)) {
         return NOT_INITIALIZED;
     }
 
-    jthread thread = NULL;
-    jvmtiError error = (*jvmti)->GetCurrentThread(jvmti, &thread);
-    if (error != JVMTI_ERROR_NONE || thread == NULL) {
-        return CURRENT_THREAD_UNAVAILABLE;
-    }
     ThreadState* existingState;
-    error = getState(jvmti, thread, &existingState);
+    jvmtiError error = getState(jvmti, &existingState);
     if (error != JVMTI_ERROR_NONE) {
-        deleteLocalReference(thread);
         return (int) error + 1000;
     }
     if (existingState != NULL) {
-        deleteLocalReference(thread);
         return ALREADY_REGISTERED;
     }
 
     ThreadState* state = malloc(sizeof(*state));
     if (state == NULL) {
-        deleteLocalReference(thread);
         return OUT_OF_MEMORY;
     }
     *state = (ThreadState) {0};
@@ -452,8 +425,7 @@ static int registerCurrentThread(void)
     state->mountCount = 1;
     state->mounted = true;
 
-    error = (*jvmti)->SetThreadLocalStorage(jvmti, thread, state);
-    deleteLocalReference(thread);
+    error = (*jvmti)->SetThreadLocalStorage(jvmti, NULL, state);
     if (error != JVMTI_ERROR_NONE) {
         free(state);
         return (int) error + 1000;
@@ -470,24 +442,16 @@ static int unregisterCurrentThread(void)
         return NOT_INITIALIZED;
     }
 
-    jthread thread = NULL;
-    jvmtiError error = (*jvmti)->GetCurrentThread(jvmti, &thread);
-    if (error != JVMTI_ERROR_NONE || thread == NULL) {
-        return CURRENT_THREAD_UNAVAILABLE;
-    }
     ThreadState* state;
-    error = getState(jvmti, thread, &state);
+    jvmtiError error = getState(jvmti, &state);
     if (error != JVMTI_ERROR_NONE) {
-        deleteLocalReference(thread);
         return (int) error + 1000;
     }
     if (state == NULL) {
-        deleteLocalReference(thread);
         return NOT_REGISTERED;
     }
 
-    error = clearState(jvmti, thread, state);
-    deleteLocalReference(thread);
+    error = clearState(jvmti, state);
     if (error != JVMTI_ERROR_NONE) {
         return (int) error + 1000;
     }
