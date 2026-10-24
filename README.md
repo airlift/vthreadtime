@@ -37,9 +37,13 @@ After the first successful initialization:
 
 - **Unregistered threads:** Mount, unmount, and thread-end callbacks are enabled
   for every virtual thread until the JVM exits. An unregistered thread performs
-  a fast lookup and returns. The callback adds roughly 35–55 ns per
-  mount/unmount cycle in a deliberately zero-work `Thread.yield()` loop. There
-  is no useful universal percentage: it was indistinguishable from noise in
+  a fast lookup and returns. In a deliberately zero-work `Thread.yield()` loop,
+  this adds about 75–160 ns per mount/unmount cycle on a JVM that already runs
+  a JVMTI agent, as most monitored production JVMs do: APM agents, profilers,
+  and jvmkill in Trino's Docker image all load one. On a JVM with no agent it
+  adds about 150–240 ns, because the first JVMTI environment also moves
+  HotSpot's virtual-thread transitions to a slower path. There is no useful
+  universal percentage: it was indistinguishable from noise in
   production-shaped tiny-query tests, and its relative cost shrinks as useful
   work between transitions grows. It is most visible in transition-only loops.
   Merely adding the library to the class path or module path has no effect.
@@ -50,40 +54,43 @@ After the first successful initialization:
   measured JVM-specific value, not a guaranteed size.
 
 - **Registered threads:** The cost has two parts:
-  - A `mountedTimeNanos()` begin/end pair adds about 57–81 ns per measured
-    operation. A platform-thread CPU-time begin/end pair adds about 322–399 ns
-    per operation, but does not add work at parks.
-  - Virtual tracking also adds work at each mount and unmount. In a synthetic
-    one-carrier blocked-handoff benchmark, fully enabled tracking added about
-    0.60–0.72 us of target/carrier CPU per park.
+  - A `mountedTimeNanos()` begin/end pair adds about 46–68 ns per measured
+    operation, about the same as two `System.nanoTime()` calls. A
+    platform-thread CPU-time begin/end pair adds about 322–399 ns per
+    operation, but does not add work at parks.
+  - Virtual tracking also adds about 45–70 ns at each mount/unmount cycle.
+    In a synthetic one-carrier blocked-handoff benchmark, where a platform
+    thread wakes a virtual thread, the library with tracking added about
+    0.13 us of process CPU per park on Graviton and was within noise on Intel.
+    That run had no agent, so it includes the slower JVM path.
 
   The park cost must be compared with its baseline. In that same benchmark:
 
-  | Host | Platform park CPU | Virtual park CPU without tracking | Tracking added per virtual park |
-  | --- | ---: | ---: | ---: |
-  | AWS Graviton4 | 3.7 us | 7.0 us | 0.60 us |
-  | AWS Intel | 9.4 us | 14.1 us | 0.72 us |
+  | Host | Park CPU without the library | Added with tracking |
+  | --- | ---: | ---: |
+  | AWS Graviton5 | 4.5 us | 0.13 us |
+  | AWS Graviton4 | 5.9 us | 0.14 us |
+  | AWS Intel | 7.2 us | within noise |
 
   This deliberately transition-heavy workload performed almost no useful work
-  between parks, so tracking added about 5–9% to target/carrier CPU. Each
-  handoff was blocked for about 60–88 us, and tracking added about 0.5–0.8 us
-  of wall time per park: less than 1%. These are measured workload-specific
-  costs, not intrinsic `park()` constants.
+  between parks, so the library added only about 2–3% to process CPU. These
+  are measured workload-specific costs, not intrinsic `park()` constants.
 
 - **Pathological transition rates:** The problematic cases are loops that
   repeatedly call `Thread.yield()` or `parkNanos()` with almost no useful work
-  between transitions. A zero-delay timed-park stress measured about
-  0.32–0.38 us of additional process CPU per park, but its Linux timer work was
-  too noisy to treat as a normal latency or total-host-cost result. The library
-  exposes `mountCount()` and `unmountCount()` so integrations can detect this
-  pattern. The tested Trino prototype stopped detailed timing after 50 unmounts
-  with less than 2 ms of mounted time and fell back to wall time. That policy
-  is not automatic or part of this library; the JVM-wide callbacks remain
-  enabled.
+  between transitions. In a stress test where two virtual threads did nothing
+  but wake each other on one carrier, the library with tracking doubled to
+  tripled the CPU per operation. The library exposes `mountCount()` and
+  `unmountCount()` so integrations can detect this pattern. The tested Trino
+  prototype stopped detailed timing after 50 unmounts with less than 2 ms of
+  mounted time and fell back to wall time. That policy is not automatic or
+  part of this library; the JVM-wide callbacks remain enabled.
 
-These effects were measured directly with Corretto 25.0.3 on AWS Graviton4 and
-Intel machines, including production-shaped Trino scheduler workloads. The
-global callbacks are a deliberate JDK 25 tradeoff. Enabling and disabling
+These effects were measured with Corretto 25.0.4.1 on AWS Graviton5,
+Graviton4, and Intel machines, as described in
+[Measuring runtime overhead](docs/measuring-overhead.md).
+
+The global callbacks are a deliberate JDK 25 tradeoff. Enabling and disabling
 notifications per registered thread reduced throughput by about 95% in
 short-lived one-shot-split and tiny-query workloads because JDK 25 globally
 synchronizes every notification change. The one-shot drivers did not unmount
