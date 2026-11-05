@@ -13,11 +13,15 @@
  */
 package io.airlift.vthreadtime;
 
+import com.sun.management.OperatingSystemMXBean;
+import jdk.management.VirtualThreadSchedulerMXBean;
 import org.junit.jupiter.api.Test;
 
+import java.lang.management.ManagementFactory;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
 
@@ -26,6 +30,9 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class TestVirtualThreadTime
 {
+    // Default maximum pool size of the virtual thread scheduler; parallelism above it is rejected
+    private static final int DEFAULT_MAX_POOL_SIZE = 256;
+
     @Test
     void testSupported()
     {
@@ -76,18 +83,64 @@ class TestVirtualThreadTime
     void testMountedTimeIncreasesWhileRunning()
             throws Exception
     {
+        long threshold = Duration.ofMillis(5).toNanos();
         long mountedNanos = onVirtualThread(() -> {
             try (VirtualThreadTime time = VirtualThreadTime.register()) {
                 long start = time.mountedTimeNanos();
-                long end = System.nanoTime() + Duration.ofMillis(10).toNanos();
-                while (System.nanoTime() < end) {
+                // Mounted time is carrier CPU time, so spin until enough of it accumulates
+                long deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
+                while (time.mountedTimeNanos() - start < threshold && System.nanoTime() < deadline) {
                     Thread.onSpinWait();
                 }
                 return time.mountedTimeNanos() - start;
             }
         });
 
-        assertThat(mountedNanos).isGreaterThan(Duration.ofMillis(5).toNanos());
+        assertThat(mountedNanos).isGreaterThan(threshold);
+    }
+
+    @Test
+    void testMountedTimeExcludesCarrierWaitingForCpu()
+            throws InterruptedException
+    {
+        VirtualThreadSchedulerMXBean scheduler = ManagementFactory.getPlatformMXBean(VirtualThreadSchedulerMXBean.class);
+        OperatingSystemMXBean os = (OperatingSystemMXBean) ManagementFactory.getOperatingSystemMXBean();
+        int originalParallelism = scheduler.getParallelism();
+        int threads = Math.min(Runtime.getRuntime().availableProcessors() * 3, DEFAULT_MAX_POOL_SIZE);
+        AtomicLong mountedNanos = new AtomicLong();
+        long spinNanos = Duration.ofSeconds(1).toNanos();
+
+        long cpuBefore;
+        long cpuNanos;
+        scheduler.setParallelism(threads);
+        try {
+            cpuBefore = os.getProcessCpuTime();
+            List<Thread> spinners = new ArrayList<>();
+            for (int index = 0; index < threads; index++) {
+                spinners.add(Thread.ofVirtual().start(() -> {
+                    try (VirtualThreadTime time = VirtualThreadTime.register()) {
+                        long start = time.mountedTimeNanos();
+                        long end = System.nanoTime() + spinNanos;
+                        while (System.nanoTime() < end) {
+                            Thread.onSpinWait();
+                        }
+                        mountedNanos.addAndGet(time.mountedTimeNanos() - start);
+                    }
+                }));
+            }
+            for (Thread spinner : spinners) {
+                spinner.join();
+            }
+            cpuNanos = os.getProcessCpuTime() - cpuBefore;
+        }
+        finally {
+            scheduler.setParallelism(originalParallelism);
+        }
+
+        // With more carriers than cores, wall time between mount and unmount includes time spent
+        // waiting for a CPU. Mounted time must stay within the CPU time the process actually used.
+        assertThat(mountedNanos.get()).isLessThanOrEqualTo((long) (cpuNanos * 1.05));
+        assertThat(mountedNanos.get()).isGreaterThanOrEqualTo(cpuNanos / 2);
     }
 
     @Test

@@ -37,7 +37,7 @@
         <air.compiler.fail-warnings>true</air.compiler.fail-warnings>
         <air.check.skip-pmd>true</air.check.skip-pmd>
         <air.javadoc.lint>all,-missing</air.javadoc.lint>
-        <air.test.jvm.additional-arguments>--enable-native-access=io.airlift.vthreadtime --illegal-native-access=deny</air.test.jvm.additional-arguments>
+        <air.test.jvm.additional-arguments>--enable-native-access=io.airlift.vthreadtime --illegal-native-access=deny --add-modules=jdk.management --add-reads=io.airlift.vthreadtime=jdk.management,java.management</air.test.jvm.additional-arguments>
         <project.build.targetJdk>25</project.build.targetJdk>
         <vthreadtime.native.resources>${project.build.directory}/generated-native-resources</vthreadtime.native.resources>
     </properties>
@@ -113,6 +113,17 @@
                         </path>
                     </annotationProcessorPaths>
                 </configuration>
+                <executions>
+                    <execution>
+                        <id>default-testCompile</id>
+                        <configuration>
+                            <compilerArgs combine.children="append">
+                                <arg>--add-modules=jdk.management</arg>
+                                <arg>--add-reads=io.airlift.vthreadtime=jdk.management,java.management</arg>
+                            </compilerArgs>
+                        </configuration>
+                    </execution>
+                </executions>
             </plugin>
         </plugins>
     </build>

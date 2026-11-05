@@ -101,10 +101,13 @@ static bool injectInitializationFault(const char* point)
 }
 #endif
 
-static bool monotonicTime(uint64_t* result)
+// Mounted time is the CPU time of the carrier thread, not wall time. A carrier that waits in the
+// OS run queue while a virtual thread is mounted on it must not charge that wait to the virtual
+// thread. All callers run on the carrier, so each start and end pair reads the same thread clock.
+static bool carrierCpuTime(uint64_t* result)
 {
     struct timespec value = {0};
-    if (clock_gettime(CLOCK_MONOTONIC, &value) != 0) {
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) != 0) {
         return false;
     }
     *result = ((uint64_t) value.tv_sec * 1000000000ULL) + (uint64_t) value.tv_nsec;
@@ -160,7 +163,7 @@ static void JNICALL onMount(jvmtiEnv* jvmti, ...)
         return;
     }
 
-    state->mountStartedValid = monotonicTime(&state->mountStarted);
+    state->mountStartedValid = carrierCpuTime(&state->mountStarted);
     state->mountCount++;
     state->mounted = true;
 }
@@ -184,7 +187,7 @@ static void JNICALL onUnmount(jvmtiEnv* jvmti, ...)
     }
 
     uint64_t now;
-    if (state->mountStartedValid && monotonicTime(&now) && now >= state->mountStarted) {
+    if (state->mountStartedValid && carrierCpuTime(&now) && now >= state->mountStarted) {
         state->mountedNanos += now - state->mountStarted;
     }
     state->unmountCount++;
@@ -426,7 +429,7 @@ static int registerCurrentThread(void)
         return OUT_OF_MEMORY;
     }
     *state = (ThreadState) {0};
-    state->mountStartedValid = monotonicTime(&state->mountStarted);
+    state->mountStartedValid = carrierCpuTime(&state->mountStarted);
     state->mountCount = 1;
     state->mounted = true;
 
@@ -490,7 +493,7 @@ VTHREADTIME_EXPORT int64_t airlift_vthreadtime_mounted_nanos(void)
     }
     uint64_t mountedNanos = state->mountedNanos;
     uint64_t now;
-    if (state->mounted && state->mountStartedValid && monotonicTime(&now) && now >= state->mountStarted) {
+    if (state->mounted && state->mountStartedValid && carrierCpuTime(&now) && now >= state->mountStarted) {
         mountedNanos += now - state->mountStarted;
     }
     return (int64_t) mountedNanos;

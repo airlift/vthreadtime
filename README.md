@@ -27,9 +27,13 @@ try (VirtualThreadTime time = VirtualThreadTime.register()) {
 }
 ```
 
-Mounted time includes only intervals when the virtual thread is mounted on a
-carrier. Time spent unmounted while sleeping, parking, or waiting for I/O is
-excluded. A tracker is confined to the virtual thread that registered it.
+Mounted time is the CPU time of the carrier thread while the virtual thread is
+mounted on it. Time spent unmounted while sleeping, parking, or waiting for I/O
+is excluded. So is time the carrier spends off the CPU while the virtual thread
+is mounted: waiting in the OS run queue when the scheduler has more carriers
+than cores, or blocked while the virtual thread is pinned. Kernel time spent on
+behalf of the virtual thread is included. A tracker is confined to the virtual
+thread that registered it.
 
 ## Runtime overhead
 
@@ -49,7 +53,10 @@ After the first successful initialization:
   is registered. The memory is released when the thread ends. This is a
   measured JVM-specific value, not a guaranteed size.
 
-- **Registered threads:** The cost has two parts:
+- **Registered threads:** Mounted time reads the carrier thread's CPU clock at
+  every mount, unmount, and `mountedTimeNanos()` call. On Linux that clock is
+  not served from the vDSO, so each read is a system call. The figures below
+  predate the switch to the carrier CPU clock and have not been re-measured. The cost has two parts:
   - A `mountedTimeNanos()` begin/end pair adds about 57–81 ns per measured
     operation. A platform-thread CPU-time begin/end pair adds about 322–399 ns
     per operation, but does not add work at parks.
