@@ -130,8 +130,9 @@ Before trusting a run, confirm:
   held, events fire, `isSupported()` is true, and the agent marker is present
   exactly when expected.
 - Mounts and unmounts are at least the number of yields when tracked.
-- `mountedTimeNanos()` agrees with a busy-spin of known length, and the native
-  clock matches `System.nanoTime()`.
+- A busy spin's mounted time grows while it runs and never exceeds its wall
+  time. It is carrier CPU time, so it is not comparable to `System.nanoTime()`
+  beyond that bound.
 - Rounds with JIT compilation or GC activity are recorded, and each fork's
   second half of rounds is compared with its first half for drift.
 

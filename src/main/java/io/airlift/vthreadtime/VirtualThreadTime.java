@@ -58,6 +58,10 @@ public final class VirtualThreadTime
     }
 
     /// Returns cumulative mounted time since registration, in nanoseconds.
+    ///
+    /// Mounted time is the CPU time of the carrier thread while this virtual thread is mounted
+    /// on it. Time the carrier spends off the CPU, such as waiting in the OS run queue, is not
+    /// counted.
     public long mountedTimeNanos()
     {
         checkOwner();

@@ -20,23 +20,20 @@ import java.lang.foreign.SymbolLookup;
 import java.lang.invoke.MethodHandle;
 
 import static java.lang.foreign.Linker.Option.critical;
-import static java.lang.foreign.ValueLayout.JAVA_BYTE;
 import static java.lang.foreign.ValueLayout.JAVA_INT;
 import static java.lang.foreign.ValueLayout.JAVA_LONG;
 
 final class NativeAccess
 {
-    // Layout of ThreadState in vthreadtime.c
-    private static final long MOUNTED_NANOS_OFFSET = 0;
-    private static final long MOUNT_STARTED_OFFSET = 8;
+    // Layout of ThreadState in vthreadtime.c. Mounted time is only read through
+    // airlift_vthreadtime_mounted_nanos, which closes the open interval on the carrier's clock.
     private static final long MOUNT_COUNT_OFFSET = 16;
     private static final long UNMOUNT_COUNT_OFFSET = 24;
-    private static final long MOUNTED_OFFSET = 32;
-    private static final long MOUNT_STARTED_VALID_OFFSET = 33;
     private static final long STATE_SIZE = 40;
 
     private static final MethodHandle REGISTER;
     private static final MethodHandle STATE_ADDRESS;
+    private static final MethodHandle MOUNTED_NANOS;
     private static final MethodHandle UNREGISTER;
     private static final MethodHandle ACTIVE_REGISTRATIONS;
     private static final Throwable INITIALIZATION_FAILURE;
@@ -44,6 +41,7 @@ final class NativeAccess
     static {
         MethodHandle register = null;
         MethodHandle stateAddress = null;
+        MethodHandle mountedNanos = null;
         MethodHandle unregister = null;
         MethodHandle activeRegistrations = null;
         Throwable initializationFailure = null;
@@ -60,6 +58,10 @@ final class NativeAccess
             stateAddress = linker.downcallHandle(
                     symbols.findOrThrow("airlift_vthreadtime_state_address"),
                     FunctionDescriptor.of(JAVA_LONG),
+                    critical(false));
+            mountedNanos = linker.downcallHandle(
+                    symbols.findOrThrow("airlift_vthreadtime_mounted_nanos"),
+                    FunctionDescriptor.of(JAVA_LONG, JAVA_LONG),
                     critical(false));
             unregister = linker.downcallHandle(
                     symbols.findOrThrow("airlift_vthreadtime_unregister"),
@@ -78,6 +80,7 @@ final class NativeAccess
         }
         REGISTER = register;
         STATE_ADDRESS = stateAddress;
+        MOUNTED_NANOS = mountedNanos;
         UNREGISTER = unregister;
         ACTIVE_REGISTRATIONS = activeRegistrations;
         INITIALIZATION_FAILURE = initializationFailure;
@@ -109,17 +112,16 @@ final class NativeAccess
         return MemorySegment.ofAddress(address).reinterpret(STATE_SIZE);
     }
 
-    /// Mounted time uses the clock behind [System#nanoTime()]; the thread is mounted while it runs.
+    /// Closes the open mounted interval natively on the carrier's CPU clock, which Java cannot read
+    /// for the carrier of a virtual thread.
     static long mountedNanos(MemorySegment state)
     {
-        long mountedNanos = state.get(JAVA_LONG, MOUNTED_NANOS_OFFSET);
-        if (state.get(JAVA_BYTE, MOUNTED_OFFSET) != 0 && state.get(JAVA_BYTE, MOUNT_STARTED_VALID_OFFSET) != 0) {
-            long elapsed = System.nanoTime() - state.get(JAVA_LONG, MOUNT_STARTED_OFFSET);
-            if (elapsed >= 0) {
-                mountedNanos += elapsed;
-            }
+        try {
+            return (long) MOUNTED_NANOS.invokeExact(state.address());
         }
-        return mountedNanos;
+        catch (Throwable throwable) {
+            throw new IllegalStateException("Native call failed", throwable);
+        }
     }
 
     static long mountCount(MemorySegment state)
