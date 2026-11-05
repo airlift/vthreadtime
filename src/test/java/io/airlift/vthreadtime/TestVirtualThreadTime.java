@@ -91,6 +91,33 @@ class TestVirtualThreadTime
     }
 
     @Test
+    void testMountedTimeTracksWallTimeWhileMounted()
+            throws Exception
+    {
+        // A busy spin never unmounts, so mounted time must track wall time even though the native
+        // clock is a raw counter converted to nanoseconds rather than the clock behind nanoTime().
+        Measurement measurement = onVirtualThread(() -> {
+            try (VirtualThreadTime time = VirtualThreadTime.register()) {
+                long initialMountedTime = time.mountedTimeNanos();
+                long wallStart = System.nanoTime();
+                long end = wallStart + Duration.ofMillis(50).toNanos();
+                while (System.nanoTime() < end) {
+                    Thread.onSpinWait();
+                }
+                long wallNanos = System.nanoTime() - wallStart;
+                long mountedNanos = time.mountedTimeNanos() - initialMountedTime;
+                return new Measurement(wallNanos, mountedNanos, time.mountCount(), time.unmountCount());
+            }
+        });
+
+        // The mounted interval brackets the wall interval, so it is at least as long, up to clock rate
+        // differences, and only longer by the surrounding accessor calls.
+        assertThat(measurement.mountedNanos())
+                .isGreaterThanOrEqualTo(measurement.wallNanos() * 99 / 100)
+                .isLessThanOrEqualTo(measurement.wallNanos() * 101 / 100 + Duration.ofMillis(1).toNanos());
+    }
+
+    @Test
     void testDoubleRegistrationRejected()
             throws Exception
     {

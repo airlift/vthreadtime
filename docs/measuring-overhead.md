@@ -130,8 +130,9 @@ Before trusting a run, confirm:
   held, events fire, `isSupported()` is true, and the agent marker is present
   exactly when expected.
 - Mounts and unmounts are at least the number of yields when tracked.
-- `mountedTimeNanos()` agrees with a busy-spin of known length, and the native
-  clock matches `System.nanoTime()`.
+- `mountedTimeNanos()` agrees with a busy-spin of known length measured with
+  `System.nanoTime()`, which also checks the tick-to-nanosecond conversion of
+  the hardware counter. `TestVirtualThreadTime` asserts this within 1%.
 - Rounds with JIT compilation or GC activity are recorded, and each fork's
   second half of rounds is compared with its first half for drift.
 
@@ -152,3 +153,76 @@ Before trusting a run, confirm:
 - **Timed park and TCP on c8g.** Both showed 10–15% added CPU on c8g against
   1–5% on the other hosts; for timed park, wall time barely changed. This was
   not explained.
+
+## November 2026: hardware counters instead of the system clock
+
+Release 1.2 replaced the two `clock_gettime` calls per mount/unmount cycle with
+a raw counter read (`CNTVCTSS_EL0` or `CNTVCT_EL0` on aarch64, `rdtsc` on
+x86_64 when the kernel's clocksource is `tsc`), converted to nanoseconds only
+when `mountedTimeNanos()` is read, which became a single critical downcall. The
+mount callback also returns at once while no thread is registered.
+
+The change was measured on a Linux aarch64 virtual machine, not on Graviton:
+
+- Apple M5 Max host, macOS, OrbStack VM with 4 vCPUs, kernel
+  7.2.12-orbstack, clocksource `arch_sys_counter`, FEAT_ECV present,
+  `CNTFRQ_EL0` 24 MHz as seen by the guest
+- Ubuntu 26.04 container, Temurin 25.0.5, gcc 15.2,
+  `-Xms1g -Xmx1g -XX:+AlwaysPreTouch`
+- The yield loop above with one carrier, 10 warmup and 20 measured rounds of
+  1,000,000 yields, three forks per variant run back to back, no pinning
+- `accessor` is one registered thread calling `mountedTimeNanos()` in a loop,
+  `count` the same for `mountCount()`, `nanotime` a `System.nanoTime()` loop as
+  a reference, all 1,000,000 calls per round
+- `register` is 100,000 short-lived virtual threads per round, each calling
+  `register()` and `close()`, including thread start and join, on the default
+  scheduler; its "before" run had a harness assertion that failed in some
+  threads, so compare it loosely
+
+Each cell is the median of the measured rounds, with the minimum and maximum
+rounds in parentheses, one row per fork:
+
+| Variant | Before (release 1.1) | After (release 1.2) |
+| --- | ---: | ---: |
+| `baseline` | 71.4 (68.8–73.1), 70.7 (69.2–76.1), 77.2 (72.2–83.8) | 81.2 (77.2–86.8), 73.9 (70.6–78.2), 72.6 (70.0–76.9) |
+| `initialized` | 164.4 (161.8–174.5), 159.8 (155.6–173.2), 170.8 (163.6–181.6) | 158.8 (153.9–168.1), 162.5 (154.6–170.5), 160.4 (155.5–168.5) |
+| `tracked` | 199.4 (192.1–207.0), 189.3 (185.9–202.6), 193.8 (186.3–205.6) | 178.3 (171.8–186.2), 178.0 (170.8–184.5), 178.5 (172.3–188.1) |
+| `accessor` | 13.4 (12.1–13.9), 13.2 (12.1–13.9), 12.3 (12.0–13.2) | 13.1 (12.1–14.3), 13.2 (12.3–18.9), 13.2 (12.2–17.2) |
+| `count` | 0.25, 0.25, 0.24 | 0.27, 0.28, 0.29 |
+| `nanotime` | 11.7 (11.6–12.1), 12.1 (11.6–15.0), 11.9 (11.4–12.6) | 13.5 (12.0–15.6), 14.1 (12.0–15.4), 13.2 (11.5–14.4) |
+| `register` (ns/thread) | 448 (420–545), 474 (403–674), 475 (401–583) | 590 (453–627), 468 (412–601), 465 (427–571) |
+
+All values are nanoseconds per operation. Taking the median fork, tracking a
+registered thread cost `tracked - initialized` = 29 ns per cycle before and
+18 ns after; the `initialized` cycle, which is what every unregistered thread
+pays, moved from 164 to 160 ns, within noise but in the direction expected from
+skipping the lookup while nothing is registered. `accessor` did not change:
+on this VM the critical downcall costs about what `System.nanoTime()` did, so
+the cheaper counter read is cancelled out. `baseline`, `nanotime` and
+`register` do not touch the changed code; their differences show the noise
+level of this setup, about 10%.
+
+The clock primitives themselves, 20,000,000 back-to-back calls in C in the same
+VM, three rounds:
+
+| Read | ns/call |
+| --- | ---: |
+| `clock_gettime(CLOCK_MONOTONIC)` (vDSO) | 11.7–11.9 |
+| `clock_gettime(CLOCK_MONOTONIC_RAW)` | 12.2–12.7 |
+| `mrs cntvct_el0` | 0.26–0.28 |
+| `mrs cntvctss_el0` | 3.8–4.0 |
+| `isb; mrs cntvct_el0` | 9.3–9.6 |
+
+A harness that includes `vthreadtime.c` and calls its static clock functions
+measured the library's `readTicks` at 3.9 ns and
+`airlift_vthreadtime_mounted_nanos` at 6.1 ns in the VM, and its
+tick-to-nanosecond conversion within 0.5 ppm of `CLOCK_MONOTONIC_RAW` over one
+second.
+
+The x86_64 path was compiled and run only under emulation on the same host.
+There the kernel clocksource is `arch_sys_counter`, so the library correctly
+declined the time stamp counter and used `clock_gettime`; forcing the
+calibration in the harness converted within 0.4 ppm of `CLOCK_MONOTONIC_RAW`.
+No x86_64 timing was taken, because emulated `rdtsc` costs are meaningless.
+Re-measure on Graviton and Intel with the procedure above before quoting
+per-cycle figures for those hosts.

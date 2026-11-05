@@ -31,13 +31,37 @@ Mounted time includes only intervals when the virtual thread is mounted on a
 carrier. Time spent unmounted while sleeping, parking, or waiting for I/O is
 excluded. A tracker is confined to the virtual thread that registered it.
 
+## Clock
+
+Mounted time is a duration, so it is measured with the cheapest monotonic
+counter the platform provides and converted to nanoseconds only when read:
+
+- **Linux aarch64:** the architected counter `CNTVCT_EL0`, read through its
+  self-synchronized form where the CPU implements FEAT_ECV (Graviton4 and
+  later), at the rate in `CNTFRQ_EL0`.
+- **Linux x86_64:** the time stamp counter, used only when the CPU reports it
+  invariant and the kernel has itself selected `tsc` as its clocksource. Its
+  rate is calibrated against `CLOCK_MONOTONIC_RAW` for about 10 ms during
+  initialization. Otherwise `CLOCK_MONOTONIC` is used.
+- **macOS:** `mach_absolute_time`.
+
+These are the counters the kernel derives its own monotonic clock from, so a
+mounted duration agrees with a `System.nanoTime()` difference up to the NTP
+rate adjustment of the system clock, at most 500 ppm. The counter is read
+without a barrier, so a stamp may be taken a few instructions early; that error
+is bounded by the pipeline depth and is far smaller than the JVM work that
+surrounds each transition. Mounted time is not an offset of
+`System.nanoTime()` and must not be mixed with it other than as a duration.
+
 ## Runtime overhead
 
 After the first successful initialization:
 
 - **Unregistered threads:** Mount, unmount, and thread-end callbacks are enabled
-  for every virtual thread until the JVM exits. An unregistered thread performs
-  a fast lookup and returns. In a deliberately zero-work `Thread.yield()` loop,
+  for every virtual thread until the JVM exits. While any thread is registered,
+  an unregistered thread performs a fast lookup and returns; with no
+  registrations the mount callback returns at once. In a deliberately zero-work
+  `Thread.yield()` loop,
   this adds about 75–160 ns per mount/unmount cycle on a JVM that already runs
   a JVMTI agent, as most monitored production JVMs do: APM agents, profilers,
   and jvmkill in Trino's Docker image all load one. On a JVM with no agent it
@@ -54,15 +78,24 @@ After the first successful initialization:
   measured JVM-specific value, not a guaranteed size.
 
 - **Registered threads:** The cost has two parts:
-  - A `mountedTimeNanos()` begin/end pair adds about 46–68 ns per measured
-    operation, about the same as two `System.nanoTime()` calls. A
-    platform-thread CPU-time begin/end pair adds about 322–399 ns per
+  - A `mountedTimeNanos()` begin/end pair is two critical downcalls that read
+    the counter natively. With the system clock used before release 1.2 it
+    added about 46–68 ns per measured operation on Graviton and Intel, about
+    the same as two `System.nanoTime()` calls; on a Linux aarch64 virtual
+    machine the counter version costs the same as before, about 13 ns per
+    call, because the downcall costs about what `System.nanoTime()` did there.
+    A platform-thread CPU-time begin/end pair adds about 322–399 ns per
     operation, but does not add work at parks.
-  - Virtual tracking also adds about 45–70 ns at each mount/unmount cycle.
-    In a synthetic one-carrier blocked-handoff benchmark, where a platform
-    thread wakes a virtual thread, the library with tracking added about
-    0.13 us of process CPU per park on Graviton and was within noise on Intel.
-    That run had no agent, so it includes the slower JVM path.
+  - Virtual tracking also adds two counter reads at each mount/unmount cycle.
+    With the system clock this was about 45–70 ns per cycle on Graviton and
+    Intel. On a Linux aarch64 virtual machine the counter cut it from about
+    28 ns to about 17 ns per cycle; Graviton has not been re-measured, and
+    should gain more because the system clock call the counter replaces is
+    slower there. In a synthetic one-carrier blocked-handoff benchmark with
+    the system clock, where a platform thread wakes a virtual thread, the
+    library with tracking added about 0.13 us of process CPU per park on
+    Graviton and was within noise on Intel. That run had no agent, so it
+    includes the slower JVM path.
 
   The park cost must be compared with its baseline. In that same benchmark:
 
@@ -88,7 +121,11 @@ After the first successful initialization:
 
 These effects were measured with Corretto 25.0.4.1 on AWS Graviton5,
 Graviton4, and Intel machines, as described in
-[Measuring runtime overhead](docs/measuring-overhead.md).
+[Measuring runtime overhead](docs/measuring-overhead.md), before the hardware
+counters replaced the system clock. The change from the counters was measured
+on a Linux aarch64 virtual machine only and is recorded in the same document;
+re-measure on Graviton and Intel before treating the registered-thread figures
+above as current.
 
 The global callbacks are a deliberate JDK 25 tradeoff. Enabling and disabling
 notifications per registered thread reduced throughput by about 95% in
