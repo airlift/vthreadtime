@@ -13,10 +13,6 @@
  */
 
 #define _POSIX_C_SOURCE 200809L
-#if defined(__APPLE__)
-// Exposes CLOCK_UPTIME_RAW.
-#define _DARWIN_C_SOURCE
-#endif
 
 #include <jni.h>
 #include <jvmti.h>
@@ -30,10 +26,26 @@
 #include <string.h>
 #include <time.h>
 
+#if defined(__APPLE__)
+#include <mach/mach_time.h>
+#elif defined(__aarch64__) && defined(__linux__)
+#include <asm/hwcap.h>
+#include <sys/auxv.h>
+#ifndef HWCAP2_ECV
+#define HWCAP2_ECV (1 << 19)
+#endif
+#elif defined(__x86_64__) && defined(__linux__)
+#include <cpuid.h>
+#include <stdio.h>
+#include <x86intrin.h>
+#endif
+
 #define VTHREADTIME_EXPORT __attribute__((visibility("default")))
 
 static const char MOUNT_EVENT_NAME[] = "com.sun.hotspot.events.VirtualThreadMount";
 static const char UNMOUNT_EVENT_NAME[] = "com.sun.hotspot.events.VirtualThreadUnmount";
+
+#define NANOS_PER_SECOND 1000000000ULL
 
 typedef enum
 {
@@ -50,11 +62,15 @@ typedef enum
     ALREADY_REGISTERED = 10,
     OUT_OF_MEMORY = 11,
     NOT_REGISTERED = 12,
+    CLOCK_UNAVAILABLE = 13,
 } Status;
 
+// Timestamps are raw ticks of the clock selected at initialization and are converted to
+// nanoseconds only when mounted time is read, so the mount and unmount callbacks never pay for
+// the conversion and accumulated time never loses tick fractions.
 typedef struct
 {
-    uint64_t mountedNanos;
+    uint64_t mountedTicks;
     uint64_t mountStarted;
     uint64_t mountCount;
     uint64_t unmountCount;
@@ -62,14 +78,16 @@ typedef struct
     bool mountStartedValid;
 } ThreadState;
 
-// NativeAccess reads this struct directly through a memory segment; keep both layouts in sync.
-_Static_assert(offsetof(ThreadState, mountedNanos) == 0, "ThreadState layout");
+// NativeAccess reads the counts directly through a memory segment; keep both layouts in sync.
+_Static_assert(offsetof(ThreadState, mountedTicks) == 0, "ThreadState layout");
 _Static_assert(offsetof(ThreadState, mountStarted) == 8, "ThreadState layout");
 _Static_assert(offsetof(ThreadState, mountCount) == 16, "ThreadState layout");
 _Static_assert(offsetof(ThreadState, unmountCount) == 24, "ThreadState layout");
 _Static_assert(offsetof(ThreadState, mounted) == 32, "ThreadState layout");
 _Static_assert(offsetof(ThreadState, mountStartedValid) == 33, "ThreadState layout");
 _Static_assert(sizeof(ThreadState) == 40, "ThreadState layout");
+
+__extension__ typedef unsigned __int128 uint128_t;
 
 static jvmtiEnv* jvmti = NULL;
 static _Atomic bool initialized = false;
@@ -78,6 +96,10 @@ static int initializationFailure = SUCCESS;
 static _Atomic uint64_t activeRegistrations = 0;
 
 static _Thread_local ThreadState* currentState = NULL;
+
+// nanos = (ticks * ticksToNanosMultiplier) >> ticksToNanosShift, evaluated in 128 bits.
+static uint64_t ticksToNanosMultiplier = 0;
+static unsigned ticksToNanosShift = 0;
 
 #if defined(VTHREADTIME_TEST_INITIALIZATION_FAULTS)
 static _Atomic bool initializationFaultInjected = false;
@@ -113,23 +135,222 @@ static bool injectInitializationFault(const char* point)
 }
 #endif
 
-// Java reads mounted time directly from the thread state and must observe the clock behind
-// System.nanoTime(): CLOCK_MONOTONIC on Linux, CLOCK_UPTIME_RAW on macOS.
-#if defined(__APPLE__)
-#define VTHREADTIME_CLOCK CLOCK_UPTIME_RAW
-#else
-#define VTHREADTIME_CLOCK CLOCK_MONOTONIC
-#endif
+// Mounted time is a duration, so the clock only needs to be monotonic and to run at a known rate
+// across carriers. That allows the cheapest counter each platform offers instead of the system
+// clock behind System.nanoTime(): the architected counter on aarch64 Linux, whose rate is the
+// counter frequency register, the time stamp counter on x86_64 Linux when the kernel itself
+// trusts it, and mach_absolute_time on macOS. Each is what the kernel derives its monotonic
+// clock from, so durations agree with System.nanoTime() up to NTP rate adjustments. Elsewhere
+// CLOCK_MONOTONIC is used and a tick is a nanosecond.
+//
+// Neither counter read is ordered with respect to preceding instructions, so a stamp may be
+// taken a few instructions early. A mount or unmount is bracketed by far more than that in
+// HotSpot's transition code, so a stamp is never taken out of order with the transition it
+// describes, and the error is bounded by the pipeline depth. This matches how Abseil and DPDK
+// read the counters, and avoids a barrier that costs as much as the system clock call it
+// replaces. aarch64 uses the self-synchronized counter where FEAT_ECV provides one.
 
-static bool monotonicTime(uint64_t* result)
+#if !defined(__APPLE__)
+static bool readPosixTicks(uint64_t* ticks)
 {
     struct timespec value = {0};
-    if (clock_gettime(VTHREADTIME_CLOCK, &value) != 0) {
+    if (clock_gettime(CLOCK_MONOTONIC, &value) != 0) {
         return false;
     }
-    *result = ((uint64_t) value.tv_sec * 1000000000ULL) + (uint64_t) value.tv_nsec;
+    *ticks = ((uint64_t) value.tv_sec * NANOS_PER_SECOND) + (uint64_t) value.tv_nsec;
     return true;
 }
+#endif
+
+// Chooses the largest shift whose multiplier fits in 63 bits, so the conversion is exact to
+// well under a nanosecond over any realistic uptime.
+static bool initializeTicksToNanos(uint64_t nanosNumerator, uint64_t nanosDenominator)
+{
+    if (nanosNumerator == 0 || nanosDenominator == 0) {
+        return false;
+    }
+    unsigned shift = 63;
+    uint128_t multiplier;
+    while (true) {
+        multiplier = (((uint128_t) nanosNumerator) << shift) / nanosDenominator;
+        if (multiplier < ((uint128_t) 1 << 63) || shift == 0) {
+            break;
+        }
+        shift--;
+    }
+    if (multiplier == 0 || multiplier >= ((uint128_t) 1 << 63)) {
+        return false;
+    }
+    ticksToNanosMultiplier = (uint64_t) multiplier;
+    ticksToNanosShift = shift;
+    return true;
+}
+
+static uint64_t ticksToNanos(uint64_t ticks)
+{
+    return (uint64_t) (((uint128_t) ticks * ticksToNanosMultiplier) >> ticksToNanosShift);
+}
+
+#if defined(__APPLE__)
+
+static bool readTicks(uint64_t* ticks)
+{
+    *ticks = mach_absolute_time();
+    return true;
+}
+
+static bool initializeClock(void)
+{
+    mach_timebase_info_data_t timebase = {0};
+    if (mach_timebase_info(&timebase) != KERN_SUCCESS) {
+        return false;
+    }
+    return initializeTicksToNanos(timebase.numer, timebase.denom);
+}
+
+#elif defined(__aarch64__) && defined(__linux__)
+
+typedef enum
+{
+    COUNTER_SELF_SYNCHRONIZED,
+    COUNTER_UNORDERED,
+    COUNTER_UNAVAILABLE,
+} ArchitectedCounter;
+
+static ArchitectedCounter architectedCounter = COUNTER_UNAVAILABLE;
+
+static bool readTicks(uint64_t* ticks)
+{
+    switch (architectedCounter) {
+        case COUNTER_SELF_SYNCHRONIZED:
+            // CNTVCTSS_EL0, which older assemblers do not know by name.
+            __asm__ volatile("mrs %0, s3_3_c14_c0_6" : "=r"(*ticks));
+            return true;
+        case COUNTER_UNORDERED:
+            __asm__ volatile("mrs %0, cntvct_el0" : "=r"(*ticks));
+            return true;
+        default:
+            return readPosixTicks(ticks);
+    }
+}
+
+static bool initializeClock(void)
+{
+    uint64_t frequency = 0;
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(frequency));
+    if (frequency == 0) {
+        // Firmware did not program the frequency register; the kernel then takes the rate from
+        // the device tree instead, which is not visible here.
+        architectedCounter = COUNTER_UNAVAILABLE;
+        return initializeTicksToNanos(1, 1);
+    }
+    architectedCounter = (getauxval(AT_HWCAP2) & HWCAP2_ECV) != 0 ? COUNTER_SELF_SYNCHRONIZED : COUNTER_UNORDERED;
+    return initializeTicksToNanos(NANOS_PER_SECOND, frequency);
+}
+
+#elif defined(__x86_64__) && defined(__linux__)
+
+static bool useTimeStampCounter = false;
+
+static bool readTicks(uint64_t* ticks)
+{
+    if (useTimeStampCounter) {
+        *ticks = __rdtsc();
+        return true;
+    }
+    return readPosixTicks(ticks);
+}
+
+static bool hasInvariantTimeStampCounter(void)
+{
+    unsigned eax = 0;
+    unsigned ebx = 0;
+    unsigned ecx = 0;
+    unsigned edx = 0;
+    if (__get_cpuid_max(0x80000000, NULL) < 0x80000007 ||
+            !__get_cpuid(0x80000007, &eax, &ebx, &ecx, &edx)) {
+        return false;
+    }
+    return (edx & (1u << 8)) != 0;
+}
+
+// The kernel selects the TSC clocksource only after verifying that the counter is constant and
+// synchronized across CPUs, so defer to its judgment instead of repeating those checks.
+static bool kernelUsesTimeStampCounter(void)
+{
+    FILE* file = fopen("/sys/devices/system/clocksource/clocksource0/current_clocksource", "r");
+    if (file == NULL) {
+        return false;
+    }
+    char name[16] = {0};
+    bool result = fgets(name, sizeof(name), file) != NULL && strcmp(name, "tsc\n") == 0;
+    (void) fclose(file);
+    return result;
+}
+
+// Pairs the counter with CLOCK_MONOTONIC_RAW, which the kernel derives from the same counter
+// with its own calibration, keeping the tightest of several attempts so a preemption between
+// the two reads does not skew the sample.
+static bool sampleTimeStampCounter(uint64_t* ticks, uint64_t* nanos)
+{
+    uint64_t bestSpread = UINT64_MAX;
+    for (int attempt = 0; attempt < 8; attempt++) {
+        uint64_t before = __rdtsc();
+        struct timespec value = {0};
+        if (clock_gettime(CLOCK_MONOTONIC_RAW, &value) != 0) {
+            return false;
+        }
+        uint64_t after = __rdtsc();
+        if (after < before || after - before >= bestSpread) {
+            continue;
+        }
+        bestSpread = after - before;
+        *ticks = before + bestSpread / 2;
+        *nanos = ((uint64_t) value.tv_sec * NANOS_PER_SECOND) + (uint64_t) value.tv_nsec;
+    }
+    return bestSpread != UINT64_MAX;
+}
+
+static bool initializeClock(void)
+{
+    useTimeStampCounter = false;
+    if (hasInvariantTimeStampCounter() && kernelUsesTimeStampCounter()) {
+        uint64_t startTicks = 0;
+        uint64_t startNanos = 0;
+        uint64_t endTicks = 0;
+        uint64_t endNanos = 0;
+        const struct timespec window = {.tv_nsec = 10000000};
+        if (sampleTimeStampCounter(&startTicks, &startNanos)) {
+            (void) nanosleep(&window, NULL);
+            if (sampleTimeStampCounter(&endTicks, &endNanos) &&
+                    endTicks > startTicks &&
+                    endNanos > startNanos + 1000000) {
+                uint64_t ticks = endTicks - startTicks;
+                uint64_t nanos = endNanos - startNanos;
+                // Accept rates between 100 MHz and 100 GHz; anything else is a broken reading.
+                if (ticks >= nanos / 10 && ticks <= nanos * 100 && initializeTicksToNanos(nanos, ticks)) {
+                    useTimeStampCounter = true;
+                    return true;
+                }
+            }
+        }
+    }
+    return initializeTicksToNanos(1, 1);
+}
+
+#else
+
+static bool readTicks(uint64_t* ticks)
+{
+    return readPosixTicks(ticks);
+}
+
+static bool initializeClock(void)
+{
+    return initializeTicksToNanos(1, 1);
+}
+
+#endif
 
 // Thread-local storage is only ever accessed for the current thread. Passing NULL takes the
 // HotSpot fast path, which avoids the VM transition, the VTMS transition disabler and the
@@ -183,7 +404,7 @@ static void JNICALL onMount(jvmtiEnv* jvmti, ...)
         return;
     }
 
-    state->mountStartedValid = monotonicTime(&state->mountStarted);
+    state->mountStartedValid = readTicks(&state->mountStarted);
     state->mountCount++;
     state->mounted = true;
 }
@@ -202,8 +423,8 @@ static void JNICALL onUnmount(jvmtiEnv* jvmti, ...)
     }
 
     uint64_t now;
-    if (state->mountStartedValid && monotonicTime(&now) && now >= state->mountStarted) {
-        state->mountedNanos += now - state->mountStarted;
+    if (state->mountStartedValid && readTicks(&now) && now >= state->mountStarted) {
+        state->mountedTicks += now - state->mountStarted;
     }
     state->unmountCount++;
     state->mounted = false;
@@ -309,6 +530,12 @@ static int initializeLocked(void)
         return SUCCESS;
     }
     if (initializationFailure != SUCCESS) {
+        return initializationFailure;
+    }
+
+    // Select the clock before touching the JVM, so a failure here leaves no JVMTI state behind.
+    if (!initializeClock()) {
+        initializationFailure = CLOCK_UNAVAILABLE;
         return initializationFailure;
     }
 
@@ -426,7 +653,7 @@ static int registerCurrentThread(void)
         return OUT_OF_MEMORY;
     }
     *state = (ThreadState) {0};
-    state->mountStartedValid = monotonicTime(&state->mountStarted);
+    state->mountStartedValid = readTicks(&state->mountStarted);
     state->mountCount = 1;
     state->mounted = true;
 
@@ -476,6 +703,19 @@ VTHREADTIME_EXPORT int airlift_vthreadtime_register(void)
 VTHREADTIME_EXPORT int64_t airlift_vthreadtime_state_address(void)
 {
     return (int64_t) (intptr_t) currentState;
+}
+
+// Called by the registered thread through a critical downcall while it is mounted, so the state
+// is stable and the open interval ends now.
+VTHREADTIME_EXPORT int64_t airlift_vthreadtime_mounted_nanos(int64_t stateAddress)
+{
+    const ThreadState* state = (const ThreadState*) (intptr_t) stateAddress;
+    uint64_t ticks = state->mountedTicks;
+    uint64_t now;
+    if (state->mounted && state->mountStartedValid && readTicks(&now) && now >= state->mountStarted) {
+        ticks += now - state->mountStarted;
+    }
+    return (int64_t) ticksToNanos(ticks);
 }
 
 VTHREADTIME_EXPORT int airlift_vthreadtime_unregister(void)
