@@ -168,11 +168,16 @@ static void JNICALL onMount(jvmtiEnv* jvmti, ...)
 #if defined(VTHREADTIME_TEST_INITIALIZATION_FAULTS)
     atomic_fetch_add_explicit(&testCallbackCount, 1, memory_order_relaxed);
 #endif
-    currentState = NULL;
-    ThreadState* state;
-    if (getState(jvmti, &state) != JVMTI_ERROR_NONE) {
+    // With no registrations there is no state to find, so skip the JVMTI lookup that every
+    // other mount pays. A thread's own registration is ordered before its later mounts by the
+    // scheduler handoff, so a registered thread never observes a stale zero here.
+    if (atomic_load_explicit(&activeRegistrations, memory_order_relaxed) == 0) {
+        currentState = NULL;
         return;
     }
+
+    ThreadState* state;
+    (void) getState(jvmti, &state);
     currentState = state;
     if (state == NULL) {
         return;
