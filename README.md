@@ -35,44 +35,86 @@ than cores, or blocked while the virtual thread is pinned. Kernel time spent on
 behalf of the virtual thread is included. A tracker is confined to the virtual
 thread that registered it.
 
+## Mechanism
+
+At initialization the library creates a JVMTI environment and uses it once to
+retransform `java.lang.VirtualThread`, injecting a call into its `mount()`,
+`unmount()` and `run(Runnable)` methods. The call is guarded by an inline null
+check of the thread's thread-local map, so a virtual thread that has never used
+a thread local pays only that check, and a registered thread finds its tracker
+through a thread local and stamps it with the carrier's CPU clock. The hook
+classes are defined into the bootstrap class
+loader, which is the only loader `VirtualThread` can call into. No per-thread
+JVMTI state is created. The only JVMTI event left enabled is the class file
+load hook, which costs a name comparison per class loaded afterwards: HotSpot
+rebuilds a retransformed class from its original bytes and consults only the
+environments with that event enabled, so the library serves the hooked bytes
+again whenever another agent later retransforms `VirtualThread` from the same
+input, and the hooks survive. If the input differs, because another agent
+redefined the class or an agent registered before the library now changes it,
+the hooks cannot be reapplied; the library then reports them removed and
+`register()` throws `IllegalStateException` rather than measuring nothing.
+
+The retransformation depends on the structure of `VirtualThread` in JDK 25.
+When it cannot be applied, the library falls back to the JVMTI virtual-thread
+mount and unmount events, which measure the same thing at a higher cost per
+transition. The system property `io.airlift.vthreadtime.mode` selects `hooks`
+(the default) or `events` explicitly. The first initialization fixes the mode
+for the process.
+
+Creating any JVMTI environment, this library's included, makes HotSpot take a
+slower path at every virtual-thread transition for the rest of the process.
+APM agents, profilers and debuggers pay the same path, so a JVM that already
+runs one adds nothing here. The experimental flag
+`-XX:+UnlockExperimentalVMOptions -XX:-DoJVMTIVirtualThreadTransitions`
+removes it, at the price of JVMTI no longer reporting virtual threads to any
+agent or debugger in that JVM; the hooks do not need those events and then
+measure at close to the cost of a bare transition.
+
 ## Runtime overhead
 
-After the first successful initialization:
+After the first successful initialization, in the default hooks mode:
 
-- **Unregistered threads:** Mount, unmount, and thread-end callbacks are enabled
-  for every virtual thread until the JVM exits. An unregistered thread performs
-  a fast lookup and returns. In a deliberately zero-work `Thread.yield()` loop,
-  this adds about 75–160 ns per mount/unmount cycle on a JVM that already runs
-  a JVMTI agent, as most monitored production JVMs do: APM agents, profilers,
-  and jvmkill in Trino's Docker image all load one. On a JVM with no agent it
-  adds about 150–240 ns, because the first JVMTI environment also moves
-  HotSpot's virtual-thread transitions to a slower path. There is no useful
-  universal percentage: it was indistinguishable from noise in
-  production-shaped tiny-query tests, and its relative cost shrinks as useful
-  work between transitions grows. It is most visible in transition-only loops.
-  Merely adding the library to the class path or module path has no effect.
+- **All virtual threads:** Every mount and unmount runs HotSpot's JVMTI
+  transition path and the injected null check. In a deliberately zero-work
+  `Thread.yield()` loop on a Linux aarch64 virtual machine this added about
+  32 ns to a 70 ns mount/unmount cycle, against about 80 ns for the events
+  mode in the same run, and about 1 ns with the transitions flag above. There
+  is no useful universal percentage: the cost is fixed per transition, so its
+  relative weight shrinks as useful work between transitions grows, and it is
+  most visible in transition-only loops. Merely adding the library to the class
+  path or module path has no effect.
 
-- **Memory:** On HotSpot JDK 25, assume about 266 bytes of additional native
-  memory for every live virtual thread after initialization, whether or not it
-  is registered. The memory is released when the thread ends. This is a
-  measured JVM-specific value, not a guaranteed size.
+- **Memory:** No native memory per thread. A virtual thread that uses thread
+  locals but is not registered gets one empty thread-local entry of about 40
+  bytes on its first mount.
 
-- **Registered threads:** Mounted time reads the carrier thread's CPU clock at
-  every mount, unmount, and `mountedTimeNanos()` call. On Linux that clock is
-  not served from the vDSO, so each read is a system call. The figures below
-  predate the switch to the carrier CPU clock and have not been re-measured.
-  The cost has two parts:
-  - A `mountedTimeNanos()` begin/end pair adds about 46–68 ns per measured
-    operation, about the same as two `System.nanoTime()` calls. A
-    platform-thread CPU-time begin/end pair adds about 322–399 ns per
-    operation, but does not add work at parks.
-  - Virtual tracking also adds about 45–70 ns at each mount/unmount cycle.
-    In a synthetic one-carrier blocked-handoff benchmark, where a platform
-    thread wakes a virtual thread, the library with tracking added about
-    0.13 us of process CPU per park on Graviton and was within noise on Intel.
-    That run had no agent, so it includes the slower JVM path.
+- **Registered threads:** The hooks read the carrier thread's CPU clock at
+  each mount and unmount, and `mountedTimeNanos()` reads it once more. On Linux
+  that clock is not served from the vDSO, so each read is a system call, about
+  130 ns in the same virtual machine against 11 ns for the monotonic clock.
+  A registered thread therefore pays about 290 ns more per cycle than an
+  unregistered one, in both modes, a `mountedTimeNanos()` call costs about
+  140 ns, and registering and closing a short-lived thread about 316 ns
+  including its start and join, against about 631 ns with the events.
 
-  The park cost must be compared with its baseline. In that same benchmark:
+- **Pathological transition rates:** The problematic cases remain loops that
+  repeatedly call `Thread.yield()` or `parkNanos()` with almost no useful work
+  between transitions, where the fixed cost per transition dominates. The
+  library exposes `mountCount()` and `unmountCount()` so integrations can detect
+  this pattern.
+
+In the events mode, used as the fallback or when configured, mount, unmount and
+thread-end callbacks are enabled for every virtual thread until the JVM exits,
+HotSpot delivers each event through a JNI handle block and a native transition,
+and it allocates about 266 bytes of native memory for every live virtual thread
+at its first event. Measured with the monotonic clock before release 1.2, on
+Corretto 25.0.4.1 and AWS Graviton5, Graviton4 and Intel hosts, that cost an
+unregistered thread 75–160 ns per cycle on a JVM that already ran a JVMTI
+agent and 150–240 ns on one that did not, a registered thread 45–70 ns per
+cycle more, and a `mountedTimeNanos()` begin/end pair 46–68 ns. In a
+one-carrier blocked-handoff benchmark it added about 0.13 us of process CPU
+per park on Graviton and was within noise on Intel:
 
   | Host | Park CPU without the library | Added with tracking |
   | --- | ---: | ---: |
@@ -80,36 +122,21 @@ After the first successful initialization:
   | AWS Graviton4 | 5.9 us | 0.14 us |
   | AWS Intel | 7.2 us | within noise |
 
-  This deliberately transition-heavy workload performed almost no useful work
-  between parks, so the library added only about 2–3% to process CPU. These
-  are measured workload-specific costs, not intrinsic `park()` constants.
+The events are enabled globally because enabling them per registered thread
+reduced throughput by about 95% in short-lived workloads: JDK 25 synchronizes
+every notification change across all virtual-thread transitions.
 
-- **Pathological transition rates:** The problematic cases are loops that
-  repeatedly call `Thread.yield()` or `parkNanos()` with almost no useful work
-  between transitions. In a stress test where two virtual threads did nothing
-  but wake each other on one carrier, the library with tracking doubled to
-  tripled the CPU per operation. The library exposes `mountCount()` and
-  `unmountCount()` so integrations can detect this pattern. The tested Trino
-  prototype stopped detailed timing after 50 unmounts with less than 2 ms of
-  mounted time and fell back to wall time. That policy is not automatic or
-  part of this library; the JVM-wide callbacks remain enabled.
-
-These effects were measured with Corretto 25.0.4.1 on AWS Graviton5,
-Graviton4, and Intel machines, as described in
-[Measuring runtime overhead](docs/measuring-overhead.md).
-
-The global callbacks are a deliberate JDK 25 tradeoff. Enabling and disabling
-notifications per registered thread reduced throughput by about 95% in
-short-lived one-shot-split and tiny-query workloads because JDK 25 globally
-synchronizes every notification change. The one-shot drivers did not unmount
-after registration, so the collapse came from registration itself rather than
-callback processing. We accept the smaller JVM-wide cost and should re-evaluate
-this choice if a future JVM implements per-thread notifications differently.
+All of these measurements are described in
+[Measuring runtime overhead](docs/measuring-overhead.md), including the
+November 2026 hooks measurements on a Linux aarch64 virtual machine. Graviton
+and Intel have not been re-measured with the hooks or the carrier CPU clock.
 
 ## Requirements
 
-Virtual Thread Time requires a HotSpot-based Java 25 JVM exposing the JVMTI
-virtual-thread mount events.
+Virtual Thread Time requires a HotSpot-based Java 25 JVM. The hooks depend on
+the structure of `java.lang.VirtualThread` in JDK 25; a JVM where the
+retransformation does not apply must expose the JVMTI virtual-thread mount
+events for the fallback.
 
 Applications using the class path must enable native access for unnamed
 modules:

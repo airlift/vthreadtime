@@ -34,6 +34,16 @@ class TestVirtualThreadTime
     }
 
     @Test
+    void testHooksAreTheDefaultMechanism()
+    {
+        // The build runs this suite without a configured mode, so hooks must have been installed
+        // rather than silently falling back to the events.
+        assertThat(System.getProperty(NativeAccess.MODE_PROPERTY)).isNull();
+        assertThat(NativeAccess.mode()).isEqualTo(NativeAccess.Mode.HOOKS);
+        assertThat(NativeAccess.hooksFailure()).isZero();
+    }
+
+    @Test
     void testPlatformThreadCannotRegister()
     {
         assertThatThrownBy(VirtualThreadTime::register)

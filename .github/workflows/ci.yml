@@ -108,8 +108,15 @@ jobs:
         run: echo "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" > compile-commit-success.txt
 
   java-compatibility:
+    name: java-compatibility (${{ matrix.java-version }})
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # The hooks retransform java.lang.VirtualThread, so every newer JDK must show
+        # whether that still applies or the events fallback is taken.
+        java-version: ['26', '27', '28-ea']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -119,7 +126,7 @@ jobs:
         uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v5
         with:
           distribution: temurin
-          java-version: 26
+          java-version: ${{ matrix.java-version }}
           cache: maven
 
       - name: Build
