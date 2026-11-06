@@ -34,6 +34,16 @@ class TestVirtualThreadTime
     }
 
     @Test
+    void testHooksAreTheDefaultMechanism()
+    {
+        // The build runs this suite without a configured mode, so hooks must have been installed
+        // rather than silently falling back to the events.
+        assertThat(System.getProperty(NativeAccess.MODE_PROPERTY)).isNull();
+        assertThat(NativeAccess.mode()).isEqualTo(NativeAccess.Mode.HOOKS);
+        assertThat(NativeAccess.hooksFailure()).isZero();
+    }
+
+    @Test
     void testPlatformThreadCannotRegister()
     {
         assertThatThrownBy(VirtualThreadTime::register)
@@ -76,18 +86,43 @@ class TestVirtualThreadTime
     void testMountedTimeIncreasesWhileRunning()
             throws Exception
     {
+        long threshold = Duration.ofMillis(5).toNanos();
         long mountedNanos = onVirtualThread(() -> {
             try (VirtualThreadTime time = VirtualThreadTime.register()) {
                 long start = time.mountedTimeNanos();
-                long end = System.nanoTime() + Duration.ofMillis(10).toNanos();
-                while (System.nanoTime() < end) {
+                // Mounted time is carrier CPU time, so spin until enough of it accumulates
+                long deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
+                while (time.mountedTimeNanos() - start < threshold && System.nanoTime() < deadline) {
                     Thread.onSpinWait();
                 }
                 return time.mountedTimeNanos() - start;
             }
         });
 
-        assertThat(mountedNanos).isGreaterThan(Duration.ofMillis(5).toNanos());
+        assertThat(mountedNanos).isGreaterThan(threshold);
+    }
+
+    @Test
+    void testMountedTimeIsBoundedByWallTime()
+            throws Exception
+    {
+        // A busy spin never unmounts and cannot use more CPU time than wall time passes.
+        Measurement measurement = onVirtualThread(() -> {
+            try (VirtualThreadTime time = VirtualThreadTime.register()) {
+                long initialMountedTime = time.mountedTimeNanos();
+                long wallStart = System.nanoTime();
+                long end = wallStart + Duration.ofMillis(50).toNanos();
+                while (System.nanoTime() < end) {
+                    Thread.onSpinWait();
+                }
+                long wallNanos = System.nanoTime() - wallStart;
+                long mountedNanos = time.mountedTimeNanos() - initialMountedTime;
+                return new Measurement(wallNanos, mountedNanos, time.mountCount(), time.unmountCount());
+            }
+        });
+
+        assertThat(measurement.mountedNanos())
+                .isLessThanOrEqualTo(measurement.wallNanos() + Duration.ofMillis(1).toNanos());
     }
 
     @Test

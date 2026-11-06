@@ -130,8 +130,11 @@ Before trusting a run, confirm:
   held, events fire, `isSupported()` is true, and the agent marker is present
   exactly when expected.
 - Mounts and unmounts are at least the number of yields when tracked.
-- `mountedTimeNanos()` agrees with a busy-spin of known length, and the native
-  clock matches `System.nanoTime()`.
+- A busy spin's mounted time grows while it runs and never exceeds its wall
+  time. It is carrier CPU time, so it is not comparable to `System.nanoTime()`
+  beyond that bound; with three carriers per core the summed mounted time of
+  spinning threads must stay within the process CPU time, which
+  `TestNativeLibraryClassLoader` checks in its own JVM.
 - Rounds with JIT compilation or GC activity are recorded, and each fork's
   second half of rounds is compared with its first half for drift.
 
@@ -152,3 +155,66 @@ Before trusting a run, confirm:
 - **Timed park and TCP on c8g.** Both showed 10–15% added CPU on c8g against
   1–5% on the other hosts; for timed park, wall time barely changed. This was
   not explained.
+
+## November 2026: hooks retransformed into VirtualThread
+
+Release 1.2 replaced the JVMTI mount and unmount events with calls retransformed
+into `java.lang.VirtualThread.mount()`, `unmount()` and `run(Runnable)`, guarded
+by an inline null check of the thread's thread-local map, and made mounted time
+the carrier's CPU time, read with `CLOCK_THREAD_CPUTIME_ID` at each mount and
+unmount of a registered thread. The JVMTI environment remains and with it
+HotSpot's transition slow path. The events stay as the fallback and as
+`-Dio.airlift.vthreadtime.mode=events`.
+
+Measured in a Linux aarch64 virtual machine:
+
+- Apple M5 Max host, macOS, OrbStack VM with 4 vCPUs, kernel
+  7.2.12-orbstack
+- Ubuntu 26.04 container, Temurin 25.0.5, gcc 15.2,
+  `-Xms1g -Xmx1g -XX:+AlwaysPreTouch`
+- The yield loop above with one carrier, 10 warmup and 20 measured rounds of
+  1,000,000 yields, three forks per variant run back to back on an otherwise
+  idle host, no pinning
+- `accessor` is one registered thread calling `mountedTimeNanos()` in a loop,
+  `count` the same for `mountCount()`, `nanotime` a `System.nanoTime()` loop as
+  a reference, all 1,000,000 calls per round; `register` is 100,000 short-lived
+  virtual threads per round, each calling `register()` and `close()`, including
+  thread start and join, on the default scheduler
+
+`hooks + flag` adds
+`-XX:+UnlockExperimentalVMOptions -XX:-DoJVMTIVirtualThreadTransitions`. Cells
+are the median of rounds with the minimum and maximum in parentheses, one per
+fork, in ns per operation:
+
+| Variant | events | hooks | hooks + flag |
+| --- | ---: | ---: | ---: |
+| `baseline` | 70.6 (69.2–79.4), 70.1 (69.7–72.0), 70.0 (69.8–71.4) | 69.6 (69.3–70.4), 68.7 (68.4–69.5), 69.4 (68.0–70.8) | 72.2 (69.5–76.7), 73.3 (70.9–77.1), 71.5 (70.0–76.5) |
+| `initialized` | 152.6 (151.3–159.6), 150.6 (149.1–159.2), 150.4 (149.9–151.5) | 101.8 (101.0–103.6), 100.6 (99.7–101.4), 102.6 (101.1–107.4) | 74.8 (72.1–79.0), 70.8 (68.7–74.3), 72.3 (69.8–74.6) |
+| `tracked` | 426.5 (425.1–431.9), 427.7 (426.0–433.9), 438.1 (436.5–446.7) | 389.9 (388.1–396.3), 386.4 (382.6–401.2), 408.9 (390.7–427.1) | 355.0 (351.4–370.2), 361.1 (357.2–377.2), 355.1 (351.5–368.2) |
+| `accessor` | 138.4 (137.1–138.9), 138.2 (136.3–141.4), 137.6 (135.3–139.0) | 142.2 (137.0–153.5), 142.7 (137.7–146.9), 143.4 (138.3–148.9) | 138.0 (136.5–142.8), 137.7 (136.4–145.4), 138.0 (136.2–145.2) |
+| `count` | 0.23, 0.23, 0.23 | 1.02, 1.00, 1.02 | 1.15, 1.03, 1.10 |
+| `nanotime` | 11.4 (11.4–11.5), 11.5 (11.4–11.8), 11.5 (11.4–11.5) | 11.6 (11.5–12.4), 12.0 (11.5–13.0), 11.5 (11.5–11.6) | 11.5 (11.5–12.0), 11.6 (11.5–12.5), 11.5 (11.5–12.3) |
+| `register` (ns/thread) | 665 (612–705), 617 (563–697), 631 (574–678) | 332 (226–408), 306 (287–429), 316 (310–453) | 281 (271–400), 297 (232–425), 252 (234–302) |
+
+Taking the median fork, an unregistered thread pays `initialized - baseline` =
+80 ns per cycle with the events, 32 ns with the hooks and 1 ns with the hooks
+and the flag. A registered thread pays `tracked - initialized` = 277, 288 and
+283 ns on top of that in the three variants: two reads of the carrier CPU
+clock, which is a system call of about 133 ns in this VM (the monotonic vDSO
+clock reads in 11 ns), and a few nanoseconds of bookkeeping. `accessor` is one
+more read of that clock, so it costs about 140 ns in every variant. The hooks
+halve the cost of a short-lived registered thread, because no JVMTI thread
+state is created and freed under the global lock. `count` went from a plain
+segment load to a method handle call, 0.2 to 1 ns.
+
+The same loop measured with the monotonic clock instead of the carrier CPU
+clock, in an earlier run of the same session, gave `tracked` of 158, 106 and
+75 ns and `accessor` of 7 ns in the three variants: the CPU clock, not the
+mechanism, sets the cost of a registered thread.
+
+Not measured: Graviton and Intel; the x86_64 build (compiled and its unit tests
+run under emulation only); JVMs with CDS or AOT archives of `VirtualThread`;
+JVMs where another agent retransforms `VirtualThread` (the hooks survive a
+retransformation from the same input and are reported as removed otherwise,
+which is tested, but the cost of the class file load hook that stays enabled
+for this is not measured).

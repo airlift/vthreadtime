@@ -13,8 +13,6 @@
  */
 package io.airlift.vthreadtime;
 
-import java.lang.foreign.MemorySegment;
-
 /// Measures the time a virtual thread is mounted on carrier threads.
 ///
 /// A tracker is bound to the virtual thread that registers it. All methods,
@@ -23,13 +21,13 @@ public final class VirtualThreadTime
         implements AutoCloseable
 {
     private final Thread owner;
-    private final MemorySegment state;
+    private final Tracker tracker;
     private boolean closed;
 
-    private VirtualThreadTime(Thread owner, MemorySegment state)
+    private VirtualThreadTime(Thread owner, Tracker tracker)
     {
         this.owner = owner;
-        this.state = state;
+        this.tracker = tracker;
     }
 
     /// Returns whether the current JVM and platform support mounted-time tracking.
@@ -39,7 +37,8 @@ public final class VirtualThreadTime
         return NativeAccess.isSupported();
     }
 
-    /// Loads the process-lifetime native library and enables virtual-thread lifecycle callbacks.
+    /// Loads the process-lifetime native library and installs the virtual-thread hooks, or the
+    /// virtual-thread lifecycle callbacks when the hooks cannot be installed.
     ///
     /// @throws UnsupportedOperationException if the JVM or platform is unsupported
     public static void initialize()
@@ -58,10 +57,14 @@ public final class VirtualThreadTime
     }
 
     /// Returns cumulative mounted time since registration, in nanoseconds.
+    ///
+    /// Mounted time is the CPU time of the carrier thread while this virtual thread is mounted
+    /// on it. Time the carrier spends off the CPU, such as waiting in the OS run queue, is not
+    /// counted.
     public long mountedTimeNanos()
     {
         checkOwner();
-        return NativeAccess.mountedNanos(state);
+        return tracker.mountedTimeNanos();
     }
 
     /// Returns the number of mounted intervals since registration.
@@ -69,14 +72,14 @@ public final class VirtualThreadTime
     public long mountCount()
     {
         checkOwner();
-        return NativeAccess.mountCount(state);
+        return tracker.mountCount();
     }
 
     /// Returns the number of unmounts since registration.
     public long unmountCount()
     {
         checkOwner();
-        return NativeAccess.unmountCount(state);
+        return tracker.unmountCount();
     }
 
     /// Unregisters the current virtual thread.
@@ -87,7 +90,7 @@ public final class VirtualThreadTime
         if (closed) {
             return;
         }
-        NativeAccess.unregister();
+        tracker.close();
         closed = true;
     }
 

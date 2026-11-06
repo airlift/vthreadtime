@@ -17,6 +17,8 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.lang.foreign.Arena;
 import java.lang.foreign.FunctionDescriptor;
 import java.lang.foreign.Linker;
@@ -33,12 +35,19 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Locale;
 import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
+import java.util.jar.Attributes;
+import java.util.jar.JarEntry;
+import java.util.jar.JarOutputStream;
+import java.util.jar.Manifest;
+import java.util.spi.ToolProvider;
 
 import static java.lang.foreign.ValueLayout.JAVA_LONG;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -48,6 +57,91 @@ class TestNativeLibraryClassLoader
     private static final String INITIALIZATION_FAULT_ENVIRONMENT = "VTHREADTIME_TEST_INITIALIZATION_FAULT";
     private static final String LIBRARY_PATH_PROPERTY = "io.airlift.vthreadtime.library.path";
     private static final String TEMP_DIRECTORY_PROPERTY = "io.airlift.vthreadtime.tmpdir";
+    private static final String MODE_PROPERTY = "io.airlift.vthreadtime.mode";
+    private static final String EVENTS_MODE = "-D" + MODE_PROPERTY + "=events";
+    private static final String PARALLELISM_PROPERTY = "jdk.virtualThreadScheduler.parallelism";
+    // Default maximum pool size of the virtual thread scheduler; parallelism above it is rejected
+    private static final int DEFAULT_MAX_POOL_SIZE = 256;
+    private static final String HOOKS_REMOVED_MESSAGE = "VirtualThread was retransformed by another agent, which removed the hooks";
+
+    // A Java agent whose retransformation environment precedes the library's. The test module
+    // does not read java.instrument, so the agent is compiled from this source at test time and
+    // driven reflectively by the subprocess.
+    private static final String RETRANSFORM_AGENT_CLASS = "io.airlift.vthreadtime.agent.RetransformAgent";
+    private static final String RETRANSFORM_AGENT_SOURCE =
+            """
+            package io.airlift.vthreadtime.agent;
+
+            import java.lang.classfile.ClassFile;
+            import java.lang.classfile.ClassTransform;
+            import java.lang.classfile.CodeBuilder;
+            import java.lang.classfile.CodeElement;
+            import java.lang.classfile.CodeTransform;
+            import java.lang.instrument.ClassFileTransformer;
+            import java.lang.instrument.Instrumentation;
+            import java.security.ProtectionDomain;
+
+            public final class RetransformAgent
+            {
+                private static volatile Instrumentation instrumentation;
+                private static volatile boolean modifying;
+
+                private RetransformAgent() {}
+
+                public static void premain(String arguments, Instrumentation instrumentation)
+                {
+                    RetransformAgent.instrumentation = instrumentation;
+                    // Adding a retransformation-capable transformer before the library initializes
+                    // creates this agent's retransformation environment ahead of the library's, so
+                    // the library receives this transformer's output.
+                    instrumentation.addTransformer(new MountTransformer(), true);
+                }
+
+                /// Retransforms VirtualThread, passing its bytes through or inserting a nop into mount().
+                public static void retransform(boolean modify)
+                        throws Exception
+                {
+                    modifying = modify;
+                    instrumentation.retransformClasses(Class.forName("java.lang.VirtualThread"));
+                }
+
+                private static final class MountTransformer
+                        implements ClassFileTransformer
+                {
+                    @Override
+                    public byte[] transform(
+                            Module module,
+                            ClassLoader loader,
+                            String className,
+                            Class<?> classBeingRedefined,
+                            ProtectionDomain protectionDomain,
+                            byte[] classFile)
+                    {
+                        if (!modifying || !"java/lang/VirtualThread".equals(className)) {
+                            return null;
+                        }
+                        CodeTransform nopAtEntry = new CodeTransform()
+                        {
+                            @Override
+                            public void atStart(CodeBuilder code)
+                            {
+                                code.nop();
+                            }
+
+                            @Override
+                            public void accept(CodeBuilder code, CodeElement element)
+                            {
+                                code.with(element);
+                            }
+                        };
+                        ClassFile api = ClassFile.of();
+                        return api.transformClass(
+                                api.parse(classFile),
+                                ClassTransform.transformingMethodBodies(method -> method.methodName().equalsString("mount"), nopAtEntry));
+                    }
+                }
+            }
+            """;
 
     @Test
     void testProcessLifetimeLibraryWithDisposableClassLoaders(@TempDir Path temporaryDirectory)
@@ -57,10 +151,72 @@ class TestNativeLibraryClassLoader
     }
 
     @Test
+    void testProcessLifetimeLibraryWithDisposableClassLoadersInEventsMode(@TempDir Path temporaryDirectory)
+            throws Exception
+    {
+        runSubprocess("lifecycle", temporaryDirectory, Optional.empty(), Optional.empty(), List.of(EVENTS_MODE));
+    }
+
+    @Test
+    void testInvalidModeIsUnsupported(@TempDir Path temporaryDirectory)
+            throws Exception
+    {
+        runSubprocess("invalid-mode", temporaryDirectory, Optional.empty(), Optional.empty(), List.of("-D" + MODE_PROPERTY + "=bogus"));
+    }
+
+    @Test
+    void testHooksFallbackIsLatchedProcessWide(@TempDir Path temporaryDirectory)
+            throws Exception
+    {
+        Path faultLibrary = buildTestNativeLibrary(
+                temporaryDirectory.resolve("fixture"),
+                "--test-initialization-faults");
+        for (String fault : List.of("hook-class", "module-reads", "retransform")) {
+            runSubprocess(
+                    "hooks-fallback",
+                    Files.createDirectory(temporaryDirectory.resolve("load-" + fault)),
+                    Optional.of(faultLibrary),
+                    Optional.of(fault),
+                    List.of());
+        }
+    }
+
+    @Test
+    void testHooksSurviveRetransformationByAnotherAgent(@TempDir Path temporaryDirectory)
+            throws Exception
+    {
+        Path agentJar = buildRetransformAgent(temporaryDirectory.resolve("agent"));
+        runSubprocess(
+                "foreign-retransform",
+                Files.createDirectory(temporaryDirectory.resolve("native")),
+                Optional.empty(),
+                Optional.empty(),
+                List.of("-javaagent:" + agentJar));
+    }
+
+    @Test
     void testConfiguredLibraryAndTemporaryDirectory(@TempDir Path temporaryDirectory)
             throws Exception
     {
         runSubprocess("single", temporaryDirectory, Optional.of(packagedNativeLibrary()));
+    }
+
+    @Test
+    void testMountedTimeExcludesCarrierWaitingForCpu(@TempDir Path temporaryDirectory)
+            throws Exception
+    {
+        // Regression test for issue 38: with three carriers per core, a carrier waits in the OS run
+        // queue while a virtual thread is mounted on it, and that wait must not count. The scheduler
+        // size is a JVM-wide startup property, so the scenario runs in its own JVM.
+        int carriers = Math.min(Runtime.getRuntime().availableProcessors() * 3, DEFAULT_MAX_POOL_SIZE);
+        runSubprocess(
+                "carrier-cpu",
+                temporaryDirectory,
+                Optional.empty(),
+                Optional.empty(),
+                List.of(
+                        "-D" + PARALLELISM_PROPERTY + "=" + carriers,
+                        "-Djdk.virtualThreadScheduler.maxPoolSize=" + carriers));
     }
 
     @Test
@@ -96,25 +252,28 @@ class TestNativeLibraryClassLoader
                 "thread-end-event",
                 "mount-event",
                 "unmount-event")) {
+            // The fault points are on the events path, which hooks mode never takes.
             runSubprocess(
                     "initialization-failure",
                     Files.createDirectory(temporaryDirectory.resolve("load-" + fault)),
                     Optional.of(faultLibrary),
-                    Optional.of(fault));
+                    Optional.of(fault),
+                    List.of(EVENTS_MODE));
         }
     }
 
     private static void runSubprocess(String mode, Path temporaryDirectory, Optional<Path> configuredLibrary)
             throws Exception
     {
-        runSubprocess(mode, temporaryDirectory, configuredLibrary, Optional.empty());
+        runSubprocess(mode, temporaryDirectory, configuredLibrary, Optional.empty(), List.of());
     }
 
     private static void runSubprocess(
             String mode,
             Path temporaryDirectory,
             Optional<Path> configuredLibrary,
-            Optional<String> initializationFault)
+            Optional<String> initializationFault,
+            List<String> jvmOptions)
             throws Exception
     {
         Path testClasses = Path.of(TestNativeLibraryClassLoader.class.getProtectionDomain().getCodeSource().getLocation().toURI());
@@ -127,6 +286,7 @@ class TestNativeLibraryClassLoader
         command.add("--illegal-native-access=deny");
         command.add("-D" + TEMP_DIRECTORY_PROPERTY + "=" + temporaryDirectory);
         configuredLibrary.ifPresent(path -> command.add("-D" + LIBRARY_PATH_PROPERTY + "=" + path));
+        command.addAll(jvmOptions);
         command.add("-cp");
         command.add(classPath);
         command.add(ClassLoaderLifecycleMain.class.getName());
@@ -162,6 +322,41 @@ class TestNativeLibraryClassLoader
                 .describedAs("native fixture build output:%n%s", output)
                 .hasSize(1);
         return libraries.getFirst();
+    }
+
+    private static Path buildRetransformAgent(Path directory)
+            throws Exception
+    {
+        Path source = directory.resolve("src").resolve("RetransformAgent.java");
+        Files.createDirectories(source.getParent());
+        Files.writeString(source, RETRANSFORM_AGENT_SOURCE, StandardCharsets.UTF_8);
+        Path classes = Files.createDirectories(directory.resolve("classes"));
+
+        ToolProvider javac = ToolProvider.findFirst("javac")
+                .orElseThrow(() -> new IllegalStateException("The javac tool is not available in this JVM"));
+        StringWriter output = new StringWriter();
+        PrintWriter writer = new PrintWriter(output);
+        int status = javac.run(writer, writer, "-d", classes.toString(), "-proc:none", source.toString());
+        writer.flush();
+        assertThat(status)
+                .describedAs("javac output:%n%s", output)
+                .isZero();
+
+        Path jar = directory.resolve("retransform-agent.jar");
+        Manifest manifest = new Manifest();
+        Attributes attributes = manifest.getMainAttributes();
+        attributes.put(Attributes.Name.MANIFEST_VERSION, "1.0");
+        attributes.putValue("Premain-Class", RETRANSFORM_AGENT_CLASS);
+        attributes.putValue("Can-Retransform-Classes", "true");
+        try (JarOutputStream jarOutput = new JarOutputStream(Files.newOutputStream(jar), manifest);
+                var files = Files.walk(classes)) {
+            for (Path file : files.filter(Files::isRegularFile).toList()) {
+                jarOutput.putNextEntry(new JarEntry(classes.relativize(file).toString()));
+                Files.copy(file, jarOutput);
+                jarOutput.closeEntry();
+            }
+        }
+        return jar;
     }
 
     @SuppressWarnings("InterruptedExceptionSwallowed")
@@ -240,8 +435,145 @@ class TestNativeLibraryClassLoader
                 case "initialization-failure" -> testInitializationFailure(
                         libraryClasses,
                         System.getenv(INITIALIZATION_FAULT_ENVIRONMENT));
+                case "hooks-fallback" -> testHooksFallback(libraryClasses);
+                case "carrier-cpu" -> testCarrierCpuTime();
+                case "foreign-retransform" -> testForeignRetransformation();
+                case "invalid-mode" -> {
+                    WeakReference<ClassLoader> loader = verifyExpectedFailureAndRelease(libraryClasses, "Unknown " + MODE_PROPERTY + ": bogus");
+                    awaitCollected(List.of(loader));
+                    verifyPublishedLibraryCount(1);
+                }
                 default -> throw new IllegalArgumentException("Unknown mode: " + mode);
             }
+        }
+
+        private static void testCarrierCpuTime()
+                throws Exception
+        {
+            int threads = Integer.getInteger(PARALLELISM_PROPERTY);
+            VirtualThreadTime.initialize();
+            long spinNanos = Duration.ofSeconds(1).toNanos();
+            AtomicLong mountedNanos = new AtomicLong();
+            AtomicReference<Throwable> failure = new AtomicReference<>();
+
+            Duration cpuBefore = processCpuTime();
+            List<Thread> spinners = new ArrayList<>();
+            for (int index = 0; index < threads; index++) {
+                spinners.add(Thread.ofVirtual().start(() -> {
+                    try (VirtualThreadTime time = VirtualThreadTime.register()) {
+                        long start = time.mountedTimeNanos();
+                        long end = System.nanoTime() + spinNanos;
+                        while (System.nanoTime() < end) {
+                            Thread.onSpinWait();
+                        }
+                        mountedNanos.addAndGet(time.mountedTimeNanos() - start);
+                    }
+                    catch (Throwable throwable) {
+                        failure.compareAndSet(null, throwable);
+                    }
+                }));
+            }
+            for (Thread spinner : spinners) {
+                spinner.join();
+            }
+            long cpuNanos = processCpuTime().minus(cpuBefore).toNanos();
+            if (failure.get() != null) {
+                throw new AssertionError("Spinning virtual thread failed", failure.get());
+            }
+
+            // With more carriers than cores, wall time between mount and unmount includes time
+            // spent waiting for a CPU. Summed mounted time must stay within the CPU time the
+            // process actually used, and the spinners account for most of that CPU time.
+            if (mountedNanos.get() > cpuNanos * 1.05) {
+                throw new AssertionError("Mounted time %s ns exceeds process CPU time %s ns with %s carriers on %s cores"
+                        .formatted(mountedNanos.get(), cpuNanos, threads, Runtime.getRuntime().availableProcessors()));
+            }
+            if (mountedNanos.get() < cpuNanos / 2) {
+                throw new AssertionError("Mounted time %s ns is below half the process CPU time %s ns"
+                        .formatted(mountedNanos.get(), cpuNanos));
+            }
+        }
+
+        private static void testForeignRetransformation()
+                throws Exception
+        {
+            Method retransform = Class.forName(RETRANSFORM_AGENT_CLASS).getMethod("retransform", boolean.class);
+            VirtualThreadTime.initialize();
+            if (NativeAccess.mode() != NativeAccess.Mode.HOOKS) {
+                throw new AssertionError("Expected hooks mode but got " + NativeAccess.mode());
+            }
+            verifyHooksInstalled(true);
+            verifyMountsCounted();
+
+            // The agent ahead of the library passes the class through, so the library receives the
+            // bytes it installed the hooks on, serves the hooked bytes again, and the hooks survive.
+            retransform.invoke(null, false);
+            verifyHooksInstalled(true);
+            verifyMountsCounted();
+
+            // The agent changes the class. The library cannot reapply the hooks on those bytes, so
+            // it reports them removed and registration fails instead of measuring nothing.
+            retransform.invoke(null, true);
+            verifyHooksInstalled(false);
+            verifyRegistrationFails(HOOKS_REMOVED_MESSAGE);
+            startAndJoinVirtualThreads(10);
+            verifyPublishedLibraryCount(1);
+        }
+
+        private static void verifyHooksInstalled(boolean expected)
+                throws Exception
+        {
+            long installed = readPublishedValue("airlift_vthreadtime_hooks_installed");
+            if (installed != (expected ? 1 : 0)) {
+                throw new AssertionError("Expected hooks installed to be %s but the library reports %s".formatted(expected, installed));
+            }
+        }
+
+        private static void verifyMountsCounted()
+                throws Exception
+        {
+            int parks = 10;
+            AtomicReference<Throwable> failure = new AtomicReference<>();
+            Thread.ofVirtual().start(() -> {
+                try (VirtualThreadTime time = VirtualThreadTime.register()) {
+                    for (int index = 0; index < parks; index++) {
+                        LockSupport.parkNanos(Duration.ofMillis(1).toNanos());
+                    }
+                    if (time.mountCount() <= parks || time.unmountCount() < parks) {
+                        throw new AssertionError("Hooks did not count the transitions: %s mounts and %s unmounts after %s parks"
+                                .formatted(time.mountCount(), time.unmountCount(), parks));
+                    }
+                }
+                catch (Throwable throwable) {
+                    failure.set(throwable);
+                }
+            }).join();
+            if (failure.get() != null) {
+                throw new AssertionError("Registered virtual thread failed", failure.get());
+            }
+        }
+
+        private static void verifyRegistrationFails(String expectedMessage)
+                throws Exception
+        {
+            AtomicReference<Throwable> outcome = new AtomicReference<>();
+            Thread.ofVirtual().start(() -> {
+                try (VirtualThreadTime time = VirtualThreadTime.register()) {
+                    outcome.set(new AssertionError("Registration succeeded after the hooks were removed with %s mounts".formatted(time.mountCount())));
+                }
+                catch (Throwable throwable) {
+                    outcome.set(throwable);
+                }
+            }).join();
+            if (!(outcome.get() instanceof IllegalStateException exception) || !exception.getMessage().contains(expectedMessage)) {
+                throw new AssertionError("Expected registration to fail with '%s'".formatted(expectedMessage), outcome.get());
+            }
+        }
+
+        private static Duration processCpuTime()
+        {
+            return ProcessHandle.current().info().totalCpuDuration()
+                    .orElseThrow(() -> new IllegalStateException("Process CPU time is unavailable"));
         }
 
         private static void testLifecycle(URL libraryClasses)
@@ -250,6 +582,20 @@ class TestNativeLibraryClassLoader
             List<WeakReference<ClassLoader>> concurrentLoaders = initializeConcurrently(libraryClasses, 8);
             awaitCollected(concurrentLoaders);
             verifyPublishedLibraryCount(1);
+
+            // Every loader must have settled on the configured mechanism, and the hooks must be
+            // installed exactly when that mechanism is hooks.
+            String expectedMode = System.getProperty(MODE_PROPERTY, "hooks").toUpperCase(Locale.ROOT);
+            ModeSnapshot modeSnapshot = readModeOnce(libraryClasses);
+            awaitCollected(List.of(modeSnapshot.loader()));
+            if (!modeSnapshot.mode().equals(expectedMode) || modeSnapshot.hooksFailure() != 0) {
+                throw new AssertionError("Expected mode %s without hooks failure but got %s with status %s"
+                        .formatted(expectedMode, modeSnapshot.mode(), modeSnapshot.hooksFailure()));
+            }
+            long hooksInstalled = readPublishedValue("airlift_vthreadtime_hooks_installed");
+            if (hooksInstalled != (expectedMode.equals("HOOKS") ? 1 : 0)) {
+                throw new AssertionError("Unexpected hooks installation state in mode %s: %s".formatted(expectedMode, hooksInstalled));
+            }
 
             for (int index = 0; index < 10; index++) {
                 WeakReference<ClassLoader> loader = initializeAndRelease(libraryClasses);
@@ -310,6 +656,70 @@ class TestNativeLibraryClassLoader
                 throw new AssertionError("Failed initialization left an active registration");
             }
             verifyPublishedLibraryCount(1);
+        }
+
+        private static void testHooksFallback(URL libraryClasses)
+                throws Exception
+        {
+            // The injected fault breaks hooks installation once; the library must fall back to the
+            // events for the lifetime of the process, even though a later attempt would succeed.
+            WeakReference<ClassLoader> first = verifyFallbackAndRelease(libraryClasses);
+            WeakReference<ClassLoader> second = verifyFallbackAndRelease(libraryClasses);
+            awaitCollected(List.of(first, second));
+            if (readPublishedValue("airlift_vthreadtime_hooks_installed") != 0) {
+                throw new AssertionError("Hooks were installed after the events fallback");
+            }
+
+            ActiveRegistration registration = startActiveRegistration(libraryClasses);
+            awaitCollected(List.of(registration.loader()));
+            if (readActiveRegistrations(libraryClasses) != 1) {
+                throw new AssertionError("Registration after the fallback was not counted");
+            }
+            registration.release().countDown();
+            registration.thread().join();
+            assertEventuallyNoActiveRegistrations(libraryClasses);
+            verifyPublishedLibraryCount(1);
+        }
+
+        private static WeakReference<ClassLoader> verifyFallbackAndRelease(URL libraryClasses)
+                throws Exception
+        {
+            URLClassLoader loader = new URLClassLoader(new URL[] {libraryClasses}, ClassLoader.getPlatformClassLoader());
+            try (loader) {
+                Class<?> api = Class.forName("io.airlift.vthreadtime.VirtualThreadTime", true, loader);
+                if (!(boolean) api.getMethod("isSupported").invoke(null)) {
+                    throw new AssertionError("Hooks failure was not recovered by the events fallback");
+                }
+                ModeSnapshot snapshot = readMode(loader);
+                if (!snapshot.mode().equals("EVENTS") || snapshot.hooksFailure() == 0) {
+                    throw new AssertionError("Expected events fallback with a hooks failure but got %s with status %s"
+                            .formatted(snapshot.mode(), snapshot.hooksFailure()));
+                }
+                return new WeakReference<>(loader);
+            }
+        }
+
+        private static ModeSnapshot readModeOnce(URL libraryClasses)
+                throws Exception
+        {
+            try (URLClassLoader loader = new URLClassLoader(new URL[] {libraryClasses}, ClassLoader.getPlatformClassLoader())) {
+                return readMode(loader);
+            }
+        }
+
+        private static ModeSnapshot readMode(URLClassLoader loader)
+                throws Exception
+        {
+            Class<?> nativeAccess = Class.forName("io.airlift.vthreadtime.NativeAccess", true, loader);
+            Method mode = nativeAccess.getDeclaredMethod("mode");
+            mode.setAccessible(true);
+            Method hooksFailure = nativeAccess.getDeclaredMethod("hooksFailure");
+            hooksFailure.setAccessible(true);
+            Object value = mode.invoke(null);
+            return new ModeSnapshot(
+                    value == null ? "null" : ((Enum<?>) value).name(),
+                    (int) hooksFailure.invoke(null),
+                    new WeakReference<>(loader));
         }
 
         private static TransitionStorm startTransitionStorm(int threadCount)
@@ -574,6 +984,11 @@ class TestNativeLibraryClassLoader
 
         private record RegistrationSnapshot(
                 long registrations,
+                WeakReference<ClassLoader> loader) {}
+
+        private record ModeSnapshot(
+                String mode,
+                int hooksFailure,
                 WeakReference<ClassLoader> loader) {}
 
         private record RegistrationPoll(
