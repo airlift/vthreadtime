@@ -13,10 +13,6 @@
  */
 
 #define _POSIX_C_SOURCE 200809L
-#if defined(__APPLE__)
-// Exposes CLOCK_UPTIME_RAW.
-#define _DARWIN_C_SOURCE
-#endif
 
 #include <jni.h>
 #include <jvmti.h>
@@ -62,7 +58,7 @@ typedef struct
     bool mountStartedValid;
 } ThreadState;
 
-// NativeAccess reads this struct directly through a memory segment; keep both layouts in sync.
+// NativeAccess reads the counts directly through a memory segment; keep both layouts in sync.
 _Static_assert(offsetof(ThreadState, mountedNanos) == 0, "ThreadState layout");
 _Static_assert(offsetof(ThreadState, mountStarted) == 8, "ThreadState layout");
 _Static_assert(offsetof(ThreadState, mountCount) == 16, "ThreadState layout");
@@ -113,18 +109,13 @@ static bool injectInitializationFault(const char* point)
 }
 #endif
 
-// Java reads mounted time directly from the thread state and must observe the clock behind
-// System.nanoTime(): CLOCK_MONOTONIC on Linux, CLOCK_UPTIME_RAW on macOS.
-#if defined(__APPLE__)
-#define VTHREADTIME_CLOCK CLOCK_UPTIME_RAW
-#else
-#define VTHREADTIME_CLOCK CLOCK_MONOTONIC
-#endif
-
-static bool monotonicTime(uint64_t* result)
+// Mounted time is the CPU time of the carrier thread, not wall time. A carrier that waits in the
+// OS run queue while a virtual thread is mounted on it must not charge that wait to the virtual
+// thread. Every caller runs on the carrier, so each start and end pair reads the same thread clock.
+static bool carrierCpuTime(uint64_t* result)
 {
     struct timespec value = {0};
-    if (clock_gettime(VTHREADTIME_CLOCK, &value) != 0) {
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) != 0) {
         return false;
     }
     *result = ((uint64_t) value.tv_sec * 1000000000ULL) + (uint64_t) value.tv_nsec;
@@ -178,7 +169,7 @@ static void JNICALL onMount(jvmtiEnv* jvmti, ...)
         return;
     }
 
-    state->mountStartedValid = monotonicTime(&state->mountStarted);
+    state->mountStartedValid = carrierCpuTime(&state->mountStarted);
     state->mountCount++;
     state->mounted = true;
 }
@@ -197,7 +188,7 @@ static void JNICALL onUnmount(jvmtiEnv* jvmti, ...)
     }
 
     uint64_t now;
-    if (state->mountStartedValid && monotonicTime(&now) && now >= state->mountStarted) {
+    if (state->mountStartedValid && carrierCpuTime(&now) && now >= state->mountStarted) {
         state->mountedNanos += now - state->mountStarted;
     }
     state->unmountCount++;
@@ -421,7 +412,7 @@ static int registerCurrentThread(void)
         return OUT_OF_MEMORY;
     }
     *state = (ThreadState) {0};
-    state->mountStartedValid = monotonicTime(&state->mountStarted);
+    state->mountStartedValid = carrierCpuTime(&state->mountStarted);
     state->mountCount = 1;
     state->mounted = true;
 
@@ -471,6 +462,19 @@ VTHREADTIME_EXPORT int airlift_vthreadtime_register(void)
 VTHREADTIME_EXPORT int64_t airlift_vthreadtime_state_address(void)
 {
     return (int64_t) (intptr_t) currentState;
+}
+
+// Called by the registered thread through a critical downcall while it is mounted, so the state
+// is stable and the open interval ends on this carrier's clock.
+VTHREADTIME_EXPORT int64_t airlift_vthreadtime_mounted_nanos(int64_t stateAddress)
+{
+    const ThreadState* state = (const ThreadState*) (intptr_t) stateAddress;
+    uint64_t nanos = state->mountedNanos;
+    uint64_t now;
+    if (state->mounted && state->mountStartedValid && carrierCpuTime(&now) && now >= state->mountStarted) {
+        nanos += now - state->mountStarted;
+    }
+    return (int64_t) nanos;
 }
 
 VTHREADTIME_EXPORT int airlift_vthreadtime_unregister(void)

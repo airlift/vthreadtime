@@ -37,6 +37,7 @@ import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
 
@@ -48,6 +49,9 @@ class TestNativeLibraryClassLoader
     private static final String INITIALIZATION_FAULT_ENVIRONMENT = "VTHREADTIME_TEST_INITIALIZATION_FAULT";
     private static final String LIBRARY_PATH_PROPERTY = "io.airlift.vthreadtime.library.path";
     private static final String TEMP_DIRECTORY_PROPERTY = "io.airlift.vthreadtime.tmpdir";
+    private static final String PARALLELISM_PROPERTY = "jdk.virtualThreadScheduler.parallelism";
+    // Default maximum pool size of the virtual thread scheduler; parallelism above it is rejected
+    private static final int DEFAULT_MAX_POOL_SIZE = 256;
 
     @Test
     void testProcessLifetimeLibraryWithDisposableClassLoaders(@TempDir Path temporaryDirectory)
@@ -61,6 +65,24 @@ class TestNativeLibraryClassLoader
             throws Exception
     {
         runSubprocess("single", temporaryDirectory, Optional.of(packagedNativeLibrary()));
+    }
+
+    @Test
+    void testMountedTimeExcludesCarrierWaitingForCpu(@TempDir Path temporaryDirectory)
+            throws Exception
+    {
+        // Regression test for issue 38: with three carriers per core, a carrier waits in the OS run
+        // queue while a virtual thread is mounted on it, and that wait must not count. The scheduler
+        // size is a JVM-wide startup property, so the scenario runs in its own JVM.
+        int carriers = Math.min(Runtime.getRuntime().availableProcessors() * 3, DEFAULT_MAX_POOL_SIZE);
+        runSubprocess(
+                "carrier-cpu",
+                temporaryDirectory,
+                Optional.empty(),
+                Optional.empty(),
+                List.of(
+                        "-D" + PARALLELISM_PROPERTY + "=" + carriers,
+                        "-Djdk.virtualThreadScheduler.maxPoolSize=" + carriers));
     }
 
     @Test
@@ -100,21 +122,23 @@ class TestNativeLibraryClassLoader
                     "initialization-failure",
                     Files.createDirectory(temporaryDirectory.resolve("load-" + fault)),
                     Optional.of(faultLibrary),
-                    Optional.of(fault));
+                    Optional.of(fault),
+                    List.of());
         }
     }
 
     private static void runSubprocess(String mode, Path temporaryDirectory, Optional<Path> configuredLibrary)
             throws Exception
     {
-        runSubprocess(mode, temporaryDirectory, configuredLibrary, Optional.empty());
+        runSubprocess(mode, temporaryDirectory, configuredLibrary, Optional.empty(), List.of());
     }
 
     private static void runSubprocess(
             String mode,
             Path temporaryDirectory,
             Optional<Path> configuredLibrary,
-            Optional<String> initializationFault)
+            Optional<String> initializationFault,
+            List<String> jvmOptions)
             throws Exception
     {
         Path testClasses = Path.of(TestNativeLibraryClassLoader.class.getProtectionDomain().getCodeSource().getLocation().toURI());
@@ -127,6 +151,7 @@ class TestNativeLibraryClassLoader
         command.add("--illegal-native-access=deny");
         command.add("-D" + TEMP_DIRECTORY_PROPERTY + "=" + temporaryDirectory);
         configuredLibrary.ifPresent(path -> command.add("-D" + LIBRARY_PATH_PROPERTY + "=" + path));
+        command.addAll(jvmOptions);
         command.add("-cp");
         command.add(classPath);
         command.add(ClassLoaderLifecycleMain.class.getName());
@@ -240,8 +265,62 @@ class TestNativeLibraryClassLoader
                 case "initialization-failure" -> testInitializationFailure(
                         libraryClasses,
                         System.getenv(INITIALIZATION_FAULT_ENVIRONMENT));
+                case "carrier-cpu" -> testCarrierCpuTime();
                 default -> throw new IllegalArgumentException("Unknown mode: " + mode);
             }
+        }
+
+        private static void testCarrierCpuTime()
+                throws Exception
+        {
+            int threads = Integer.getInteger(PARALLELISM_PROPERTY);
+            VirtualThreadTime.initialize();
+            long spinNanos = Duration.ofSeconds(1).toNanos();
+            AtomicLong mountedNanos = new AtomicLong();
+            AtomicReference<Throwable> failure = new AtomicReference<>();
+
+            Duration cpuBefore = processCpuTime();
+            List<Thread> spinners = new ArrayList<>();
+            for (int index = 0; index < threads; index++) {
+                spinners.add(Thread.ofVirtual().start(() -> {
+                    try (VirtualThreadTime time = VirtualThreadTime.register()) {
+                        long start = time.mountedTimeNanos();
+                        long end = System.nanoTime() + spinNanos;
+                        while (System.nanoTime() < end) {
+                            Thread.onSpinWait();
+                        }
+                        mountedNanos.addAndGet(time.mountedTimeNanos() - start);
+                    }
+                    catch (Throwable throwable) {
+                        failure.compareAndSet(null, throwable);
+                    }
+                }));
+            }
+            for (Thread spinner : spinners) {
+                spinner.join();
+            }
+            long cpuNanos = processCpuTime().minus(cpuBefore).toNanos();
+            if (failure.get() != null) {
+                throw new AssertionError("Spinning virtual thread failed", failure.get());
+            }
+
+            // With more carriers than cores, wall time between mount and unmount includes time
+            // spent waiting for a CPU. Summed mounted time must stay within the CPU time the
+            // process actually used, and the spinners account for most of that CPU time.
+            if (mountedNanos.get() > cpuNanos * 1.05) {
+                throw new AssertionError("Mounted time %s ns exceeds process CPU time %s ns with %s carriers on %s cores"
+                        .formatted(mountedNanos.get(), cpuNanos, threads, Runtime.getRuntime().availableProcessors()));
+            }
+            if (mountedNanos.get() < cpuNanos / 2) {
+                throw new AssertionError("Mounted time %s ns is below half the process CPU time %s ns"
+                        .formatted(mountedNanos.get(), cpuNanos));
+            }
+        }
+
+        private static Duration processCpuTime()
+        {
+            return ProcessHandle.current().info().totalCpuDuration()
+                    .orElseThrow(() -> new IllegalStateException("Process CPU time is unavailable"));
         }
 
         private static void testLifecycle(URL libraryClasses)
