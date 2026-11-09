@@ -86,6 +86,9 @@ else
     exit 2
 fi
 
+# The JDK headers are system headers, exempt from the warnings: jvmti.h declares a callback with an
+# empty parameter list, which older compilers such as gcc 10 flag under -Wstrict-prototypes even in
+# C2x mode.
 "$compiler" \
     -std="$c_standard" \
     -O3 \
@@ -97,8 +100,8 @@ fi
     -Wpedantic \
     -Wstrict-prototypes \
     -pthread \
-    -I"${JAVA_HOME}/include" \
-    -I"${JAVA_HOME}/include/${include_platform}" \
+    -isystem "${JAVA_HOME}/include" \
+    -isystem "${JAVA_HOME}/include/${include_platform}" \
     "${compiler_arguments[@]}" \
     "${linker_arguments[@]}" \
     "$script_directory/vthreadtime.c" \

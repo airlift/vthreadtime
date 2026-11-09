@@ -21,7 +21,9 @@ import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
 import java.time.Duration;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static io.airlift.vthreadtime.VirtualThreads.onVirtualThread;
 import static java.lang.invoke.MethodType.methodType;
@@ -199,11 +201,11 @@ class TestVirtualThreadHooks
         IsolatedHooks hooks = IsolatedHooks.load();
         AtomicLong ticks = new AtomicLong(1_000_000);
 
-        assertThatThrownBy(() -> hooks.setClock().invoke(MethodHandles.constant(int.class, 1)))
+        assertThatThrownBy(() -> hooks.setClock().invoke(MethodHandles.constant(int.class, 1), clockOf(ticks)))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("()long");
-        assertThat((boolean) hooks.setClock().invoke(clockOf(ticks))).isTrue();
-        assertThat((boolean) hooks.setClock().invoke(MethodHandles.constant(long.class, 999_999_999L))).isFalse();
+        assertThat((boolean) hooks.setClock().invoke(clockOf(ticks), clockOf(ticks))).isTrue();
+        assertThat((boolean) hooks.setClock().invoke(MethodHandles.constant(long.class, 999_999_999L), clockOf(ticks))).isFalse();
 
         onVirtualThread(() -> {
             Object tracker = hooks.register().invoke();
@@ -231,6 +233,73 @@ class TestVirtualThreadHooks
     }
 
     @Test
+    void testClockReadingOfMinusOneUsesFallback()
+            throws Throwable
+    {
+        // The native clock answers -1 when it cannot read the carrier's clock without blocking;
+        // the hooks then read the fallback, which answers on the same scale.
+        IsolatedHooks hooks = IsolatedHooks.load();
+        AtomicLong ticks = new AtomicLong(-1);
+        AtomicLong fallbackTicks = new AtomicLong(1_000);
+        assertThat((boolean) hooks.setClock().invoke(clockOf(ticks), clockOf(fallbackTicks))).isTrue();
+
+        onVirtualThread(() -> {
+            Object tracker = hooks.register().invoke();
+            ticks.set(1_300);
+            assertThat((long) hooks.mountedTimeNanos().invoke(tracker)).isEqualTo(300);
+            ticks.set(-1);
+            fallbackTicks.set(1_500);
+            hooks.unmounted().invoke();
+            assertThat((long) hooks.mountedTimeNanos().invoke(tracker)).isEqualTo(500);
+            return null;
+        });
+    }
+
+    @Test
+    @SuppressWarnings("InterruptedExceptionSwallowed")
+    void testConcurrentSetClockInstallsOnePair()
+            throws Throwable
+    {
+        // Two class loaders may install their clocks at the same moment. Once either call
+        // returns, the hooks must read the winner's clock with the winner's fallback: the default
+        // clock, or the winner's clock with the default fallback, would mix scales in an interval.
+        for (int trial = 0; trial < 200; trial++) {
+            IsolatedHooks hooks = IsolatedHooks.load();
+            CountDownLatch start = new CountDownLatch(1);
+            boolean[] won = new boolean[2];
+            long[] readings = new long[2];
+            AtomicReference<Throwable> failure = new AtomicReference<>();
+            Thread[] installers = new Thread[2];
+            for (int index = 0; index < installers.length; index++) {
+                int installer = index;
+                installers[index] = Thread.ofPlatform().start(() -> {
+                    try {
+                        start.await();
+                        won[installer] = (boolean) hooks.setClock().invoke(
+                                MethodHandles.constant(long.class, -1L),
+                                MethodHandles.constant(long.class, installer + 1L));
+                        readings[installer] = (long) hooks.now().invoke();
+                    }
+                    catch (Throwable throwable) {
+                        failure.set(throwable);
+                    }
+                });
+            }
+            start.countDown();
+            for (Thread installer : installers) {
+                installer.join();
+            }
+            if (failure.get() != null) {
+                throw failure.get();
+            }
+
+            assertThat(won[0]).isNotEqualTo(won[1]);
+            long winner = won[0] ? 1 : 2;
+            assertThat(readings).containsExactly(winner, winner);
+        }
+    }
+
+    @Test
     void testZeroStampIsNoOpenInterval()
             throws Throwable
     {
@@ -239,7 +308,7 @@ class TestVirtualThreadHooks
         // read must not count either.
         IsolatedHooks hooks = IsolatedHooks.load();
         AtomicLong ticks = new AtomicLong(0);
-        assertThat((boolean) hooks.setClock().invoke(clockOf(ticks))).isTrue();
+        assertThat((boolean) hooks.setClock().invoke(clockOf(ticks), clockOf(ticks))).isTrue();
 
         onVirtualThread(() -> {
             Object tracker = hooks.register().invoke();
@@ -279,7 +348,7 @@ class TestVirtualThreadHooks
     {
         IsolatedHooks hooks = IsolatedHooks.load();
         AtomicLong ticks = new AtomicLong(1_000);
-        assertThat((boolean) hooks.setClock().invoke(clockOf(ticks))).isTrue();
+        assertThat((boolean) hooks.setClock().invoke(clockOf(ticks), clockOf(ticks))).isTrue();
 
         onVirtualThread(() -> {
             Object tracker = hooks.register().invoke();
@@ -320,6 +389,7 @@ class TestVirtualThreadHooks
     /// A private copy of the hook class with its own clock call site, and the handles to drive it.
     private record IsolatedHooks(
             MethodHandle setClock,
+            MethodHandle now,
             MethodHandle register,
             MethodHandle mounted,
             MethodHandle unmounted,
@@ -339,8 +409,10 @@ class TestVirtualThreadHooks
 
             MethodHandles.Lookup lookup = MethodHandles.publicLookup();
             MethodType reader = methodType(long.class, long[].class);
+            TestVirtualThreadHooks.class.getModule().addReads(hooks.getModule());
             return new IsolatedHooks(
-                    lookup.findStatic(hooks, "setClock", methodType(boolean.class, MethodHandle.class)),
+                    lookup.findStatic(hooks, "setClock", methodType(boolean.class, MethodHandle.class, MethodHandle.class)),
+                    MethodHandles.privateLookupIn(hooks, MethodHandles.lookup()).findStatic(hooks, "now", methodType(long.class)),
                     lookup.findStatic(hooks, "register", methodType(long[].class)),
                     lookup.findStatic(hooks, "mounted", methodType(void.class)),
                     lookup.findStatic(hooks, "unmounted", methodType(void.class)),

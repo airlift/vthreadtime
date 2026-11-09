@@ -46,6 +46,72 @@ jobs:
           java-version: 25
           cache: maven
 
+      - name: Install glibc 2.17 compiler
+        if: startsWith(matrix.native-id, 'linux-')
+        env:
+          NATIVE_ID: ${{ matrix.native-id }}
+        run: |
+          # The runner's glibc is newer than the released libraries support, and pinning symbol
+          # versions alone still names libc rather than libpthread as the provider of the pthread
+          # functions, which glibc 2.17 rejects at load time. So the library is compiled by the gcc
+          # of PyPA's manylinux2014 image, which is CentOS 7 with glibc 2.17.
+          case "${NATIVE_ID#linux-}" in
+            x86_64) image=quay.io/pypa/manylinux2014_x86_64@sha256:62eeff30ef134a85ec0f97109e008a319b0315ca5e8a6d754ee771556c02622a ;;
+            aarch64) image=quay.io/pypa/manylinux2014_aarch64@sha256:101d2292840109c9d329fcfcd7b89b46f59e19ca23cbfdcf059fb389994665fc ;;
+            *)
+              echo "No manylinux2014 image for $NATIVE_ID" >&2
+              exit 1
+              ;;
+          esac
+          docker pull --quiet "$image"
+
+          # The image's kernel headers predate the perf page fields the library reads, added in
+          # Linux 5.9, so the compiler finds this header first.
+          headers="$RUNNER_TEMP/kernel-headers"
+          mkdir -p "$headers/linux"
+          curl --fail --silent --show-error --location --retry 3 --output "$headers/linux/perf_event.h" \
+              https://raw.githubusercontent.com/torvalds/linux/v6.12/include/uapi/linux/perf_event.h
+          echo "5fc835a3641456b05473907bde2ad64460e600ab645579f3da35c61ed8d086ae  $headers/linux/perf_event.h" |
+              sha256sum --check --strict
+
+          # build-native.sh runs CC as a single command, here inside the image on the runner's own
+          # paths: the workspace, the JDK and the headers read-only, the output directory writable.
+          compiler="$RUNNER_TEMP/manylinux/cc"
+          mkdir -p "$(dirname "$compiler")"
+          cat > "$compiler" <<EOF
+          #!/usr/bin/env bash
+          image=$image
+          headers=$headers
+          EOF
+          cat >> "$compiler" <<'EOF'
+          set -euo pipefail
+          volumes=(
+              --volume "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE:ro"
+              --volume "$JAVA_HOME:$JAVA_HOME:ro"
+              --volume "$headers:$headers:ro"
+          )
+          arguments=("$@")
+          for ((index = 0; index + 1 < ${#arguments[@]}; index++)); do
+            if [[ "${arguments[index]}" == -o ]]; then
+              output_directory=$(dirname "${arguments[index + 1]}")
+              volumes+=(--volume "$output_directory:$output_directory")
+            fi
+          done
+          exec docker run --rm --user "$(id -u):$(id -g)" --workdir "$PWD" "${volumes[@]}" \
+              "$image" gcc -isystem "$headers" "$@"
+          EOF
+          chmod +x "$compiler"
+          echo "CC=$compiler" >> "$GITHUB_ENV"
+
+      - name: Allow perf events
+        # The only CI job on the perf task-clock path, the Linux default: the arm64 runner's
+        # arch_sys_counter clocksource lets user space read the event's page, and the runner has no
+        # seccomp filter. Ubuntu's default perf_event_paranoid of 4 would refuse the event.
+        if: matrix.native-id == 'linux-aarch64'
+        run: |
+          sudo sysctl -w kernel.perf_event_paranoid=2
+          echo "MAVEN_ARGS=-Dio.airlift.vthreadtime.test.perf.clock.supported=true" >> "$GITHUB_ENV"
+
       - name: Build
         run: ./mvnw clean install -B -V -P ci
 
@@ -92,6 +158,64 @@ jobs:
               --arg sha256 "$digest" \
               '{commit: $commit, platform: $platform, path: $path, sha256: $sha256}' \
               > "target/native-artifact/provenance/${NATIVE_ID}.json"
+
+      - name: Check glibc compatibility
+        if: startsWith(matrix.native-id, 'linux-')
+        run: |
+          # Released libraries load on this glibc and later
+          minimum_glibc=2.17
+          library=$(find target/native-artifact/resources -type f)
+          if ! newest_glibc=$(objdump -T "$library" | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)*' | sed 's/^GLIBC_//' | sort -V | tail -n 1); then
+            echo "Found no glibc symbol versions in $library" >&2
+            exit 1
+          fi
+          if [[ "$(printf '%s\n' "$minimum_glibc" "$newest_glibc" | sort -V | tail -n 1)" != "$minimum_glibc" ]]; then
+            echo "$library requires glibc $newest_glibc, above $minimum_glibc:" >&2
+            objdump -T "$library" | grep -E 'GLIBC_[0-9]' >&2
+            exit 1
+          fi
+
+      - name: Check loading on glibc 2.17
+        if: startsWith(matrix.native-id, 'linux-')
+        run: |
+          # CentOS 7 ships glibc 2.17. A version check alone can pass while loading fails, when a
+          # symbol is bound to the wrong library, so the library is loaded through FFM as in
+          # production and its carrier clock is read.
+          library=$(find target/native-artifact/resources -type f)
+          cat > "$RUNNER_TEMP/LoadCheck.java" <<'EOF'
+          import java.lang.foreign.Arena;
+          import java.lang.foreign.FunctionDescriptor;
+          import java.lang.foreign.Linker;
+          import java.lang.foreign.SymbolLookup;
+          import java.nio.file.Path;
+
+          import static java.lang.foreign.ValueLayout.JAVA_INT;
+          import static java.lang.foreign.ValueLayout.JAVA_LONG;
+
+          public class LoadCheck
+          {
+              public static void main(String[] args)
+                      throws Throwable
+              {
+                  Linker linker = Linker.nativeLinker();
+                  SymbolLookup library = SymbolLookup.libraryLookup(Path.of(args[0]), Arena.global());
+                  linker.downcallHandle(library.findOrThrow("airlift_vthreadtime_configure_perf_clock"), FunctionDescriptor.ofVoid(JAVA_INT))
+                          .invokeExact(0);
+                  long nanos = (long) linker.downcallHandle(library.findOrThrow("airlift_vthreadtime_carrier_cpu_nanos_blocking"), FunctionDescriptor.of(JAVA_LONG))
+                          .invokeExact();
+                  if (nanos <= 0) {
+                      throw new AssertionError("Carrier CPU clock read failed");
+                  }
+                  System.out.println("Loaded " + args[0] + " on glibc 2.17");
+              }
+          }
+          EOF
+          docker run --rm \
+              --volume "$JAVA_HOME:/jdk:ro" \
+              --volume "$PWD/$library:/check/$(basename "$library"):ro" \
+              --volume "$RUNNER_TEMP/LoadCheck.java:/check/LoadCheck.java:ro" \
+              centos:7@sha256:be65f488b7764ad3638f236b7b515b3678369a5124c47b8d32916d6487418ea4 \
+              /jdk/bin/java --enable-native-access=ALL-UNNAMED /check/LoadCheck.java "/check/$(basename "$library")"
 
       - name: Upload native library
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

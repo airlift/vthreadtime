@@ -13,6 +13,12 @@
  */
 
 #define _POSIX_C_SOURCE 200809L
+#if defined(__linux__) && (defined(__aarch64__) || defined(__x86_64__))
+#define VTHREADTIME_PERF_TASK_CLOCK
+// Exposes syscall(); glibc before 2.19 reads _BSD_SOURCE instead of _DEFAULT_SOURCE.
+#define _DEFAULT_SOURCE
+#define _BSD_SOURCE
+#endif
 
 #include <jni.h>
 #include <jvmti.h>
@@ -25,6 +31,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#if defined(VTHREADTIME_PERF_TASK_CLOCK)
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/perf_event.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 #define VTHREADTIME_EXPORT __attribute__((visibility("default")))
 
@@ -54,6 +69,14 @@ typedef struct
     const uint8_t* classData;
     int32_t length;
 } ClassDefinition;
+
+// Values of the io.airlift.vthreadtime.perf.clock system property; see configurePerfClock.
+typedef enum
+{
+    PERF_CLOCK_AUTO = 0,
+    PERF_CLOCK_ON = 1,
+    PERF_CLOCK_OFF = 2,
+} PerfClockMode;
 
 static const char VIRTUAL_THREAD_CLASS_NAME[] = "java/lang/VirtualThread";
 
@@ -115,6 +138,7 @@ static jint installedClassDataLength = 0;
 
 #if defined(VTHREADTIME_TEST_INITIALIZATION_FAULTS)
 static _Atomic bool initializationFaultInjected = false;
+static _Atomic uint64_t testTaskClockReleaseCount = 0;
 
 static bool injectInitializationFault(const char* point)
 {
@@ -131,10 +155,7 @@ static bool injectInitializationFault(const char* point)
 }
 #endif
 
-// Mounted time is the CPU time of the carrier thread, not wall time. A carrier that waits in the
-// OS run queue while a virtual thread is mounted on it must not charge that wait to the virtual
-// thread. Every caller runs on the carrier, so each start and end pair reads the same thread clock.
-static bool carrierCpuTime(uint64_t* result)
+static bool threadCpuTime(uint64_t* result)
 {
     struct timespec value = {0};
     if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) != 0) {
@@ -142,6 +163,363 @@ static bool carrierCpuTime(uint64_t* result)
     }
     *result = ((uint64_t) value.tv_sec * 1000000000ULL) + (uint64_t) value.tv_nsec;
     return true;
+}
+
+#if defined(VTHREADTIME_PERF_TASK_CLOCK)
+// On Linux the thread CPU clock is a system call, not a vDSO read. A perf task-clock event opened
+// for the calling thread counts the time the thread is scheduled on a CPU, including kernel time
+// and, where the hypervisor reports it, steal time that the thread CPU clock leaves out. Its mapped
+// page lets the thread read it in user space. Each carrier holds one event file descriptor and one
+// page charged to the user's perf locked-memory limit.
+//
+// The state belongs to the carrier, not to the virtual thread mounted on it, so it hangs off a
+// pthread key. A C thread-local would not do: the first access to one in a library loaded at
+// runtime can allocate and take a loader lock, which the critical clock must not, whereas reading
+// a key never allocates or locks. The key's destructor also releases the event when the carrier's
+// thread exits, for every kind of thread, without the per-thread JVMTI state a thread end event
+// costs. The key's value is NULL until the carrier tries the event, then the carrier's open clock,
+// or the address of taskClockUnavailable when the carrier uses the thread CPU clock.
+typedef struct
+{
+    int fd;
+    volatile struct perf_event_mmap_page* page;
+} TaskClock;
+
+static const char SECCOMP_FIELD[] = "Seccomp:";
+
+static TaskClock taskClockUnavailable = {.fd = -1};
+// Created by the first configuration, before the hooks are installed, unless the perf clock is off.
+// It is never deleted: carriers of every class loader share it, and its destructor releases each
+// carrier's event.
+static pthread_key_t taskClockKey;
+static _Atomic bool taskClockKeyCreated = false;
+// Whether a carrier checks for a seccomp filter before opening the event; the on mode skips it.
+static bool checkSeccomp = true;
+// Set by the first setup failure, or by the off mode, so later carriers never try the event.
+static _Atomic bool taskClockStopped = false;
+
+static uint64_t readCycleCounter(void)
+{
+#if defined(__aarch64__)
+    uint64_t value;
+    __asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(value) : : "memory");
+    return value;
+#else
+    uint32_t low;
+    uint32_t high;
+    __asm__ volatile("rdtsc" : "=a"(low), "=d"(high) : : "memory");
+    return ((uint64_t) high << 32) | low;
+#endif
+}
+
+// The kernel rewrites the page whenever the thread is switched back onto a CPU, so time_running
+// is the count as of that switch, and the cycle counter extrapolates it to now. Without
+// cap_user_time the page cannot be extrapolated and time_running alone can be stale by seconds.
+// If native code on the carrier calls prctl(PR_TASK_PERF_EVENTS_DISABLE), the kernel stops
+// rewriting the page but leaves it readable, so later reads also count time off the CPU; this
+// cannot be detected.
+static bool readTaskClock(volatile struct perf_event_mmap_page* page, uint64_t* result)
+{
+    uint32_t sequence;
+    bool userTime;
+    bool shortCycles;
+    uint64_t running;
+    uint64_t cycles = 0;
+    uint64_t timeOffset = 0;
+    uint64_t timeCycles = 0;
+    uint64_t timeMask = 0;
+    uint32_t timeMult = 0;
+    uint16_t timeShift = 0;
+    do {
+        sequence = page->lock;
+        atomic_thread_fence(memory_order_acquire);
+        userTime = page->cap_user_time;
+        shortCycles = page->cap_user_time_short;
+        running = page->time_running;
+        if (userTime) {
+            cycles = readCycleCounter();
+            timeOffset = page->time_offset;
+            timeMult = page->time_mult;
+            timeShift = page->time_shift;
+            if (shortCycles) {
+                timeCycles = page->time_cycles;
+                timeMask = page->time_mask;
+            }
+        }
+        atomic_thread_fence(memory_order_acquire);
+    } while (page->lock != sequence);
+
+    if (!userTime) {
+        return false;
+    }
+    if (shortCycles) {
+        cycles = timeCycles + ((cycles - timeCycles) & timeMask);
+    }
+    uint64_t quotient = cycles >> timeShift;
+    uint64_t remainder = cycles & ((1ULL << timeShift) - 1);
+    *result = running + timeOffset + (quotient * timeMult) + ((remainder * timeMult) >> timeShift);
+    return true;
+}
+
+// The same count through the file descriptor, a system call.
+static bool readTaskClockFile(int fd, uint64_t* result)
+{
+    uint64_t value;
+    if (read(fd, &value, sizeof(value)) != (ssize_t) sizeof(value)) {
+        return false;
+    }
+    *result = value;
+    return true;
+}
+
+// Whether the value of the seccomp field, up to the end of its line, is exactly 0.
+static bool isZeroField(const char* value, size_t length)
+{
+    size_t position = 0;
+    while (position < length && (value[position] == ' ' || value[position] == '\t')) {
+        position++;
+    }
+    return position + 1 == length && value[position] == '0';
+}
+
+// A seccomp filter can kill the process on perf_event_open instead of failing the call, as
+// systemd's SystemCallFilter= does by default, and a filter's policy cannot be inspected. So the
+// auto mode admits only a thread whose status explicitly reports no filter: an unreadable status,
+// or a Seccomp field that is missing, malformed or longer than the kept prefix of its line, counts
+// as filtered. The status file has no size limit, as the Groups line before the field grows with
+// the supplementary groups, so it is scanned line by line; a line only needs its first bytes kept
+// to be recognized.
+static bool mayHaveSeccompFilter(void)
+{
+    int fd = open("/proc/thread-self/status", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return true;
+    }
+    char chunk[512];
+    char line[32];
+    size_t lineLength = 0;
+    bool lineTruncated = false;
+    bool found = false;
+    bool noFilter = false;
+    while (!found) {
+        ssize_t count = read(fd, chunk, sizeof(chunk));
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count <= 0) {
+            break;
+        }
+        for (ssize_t index = 0; index < count; index++) {
+            if (chunk[index] != '\n') {
+                if (lineLength < sizeof(line)) {
+                    line[lineLength++] = chunk[index];
+                }
+                else {
+                    lineTruncated = true;
+                }
+                continue;
+            }
+            size_t fieldLength = sizeof(SECCOMP_FIELD) - 1;
+            if (lineLength >= fieldLength && memcmp(line, SECCOMP_FIELD, fieldLength) == 0) {
+                found = true;
+                noFilter = !lineTruncated && isZeroField(line + fieldLength, lineLength - fieldLength);
+                break;
+            }
+            lineLength = 0;
+            lineTruncated = false;
+        }
+    }
+    (void) close(fd);
+    return !noFilter;
+}
+
+static void closeTaskClock(TaskClock* clock)
+{
+    if (clock->page != NULL) {
+        (void) munmap((void*) clock->page, (size_t) sysconf(_SC_PAGESIZE));
+        clock->page = NULL;
+    }
+    if (clock->fd >= 0) {
+        (void) close(clock->fd);
+        clock->fd = -1;
+    }
+}
+
+// Fails without trying when the auto mode finds the thread may have a seccomp filter; the on
+// mode skips that check, and then a filter that kills on perf_event_open kills the process. Also
+// fails when the event cannot be opened (perf_event_paranoid, a seccomp filter that returns an
+// error), when its page cannot be mapped, or when the first read finds the page cannot be read in
+// user space (no cap_user_time, as on x86 KVM guests whose scheduler clock is kvm-clock).
+static bool openTaskClock(TaskClock* clock)
+{
+    *clock = (TaskClock) {.fd = -1};
+    if (checkSeccomp && mayHaveSeccompFilter()) {
+        return false;
+    }
+
+    struct perf_event_attr attributes = {0};
+    attributes.size = sizeof(attributes);
+    attributes.type = PERF_TYPE_SOFTWARE;
+    attributes.config = PERF_COUNT_SW_TASK_CLOCK;
+    // Kernel time is still counted; excluding it only lets an unprivileged process open the event.
+    attributes.exclude_kernel = 1;
+    attributes.exclude_hv = 1;
+    long fd = syscall(SYS_perf_event_open, &attributes, 0, -1, -1, PERF_FLAG_FD_CLOEXEC);
+    if (fd < 0) {
+        return false;
+    }
+    clock->fd = (int) fd;
+    void* page = mmap(NULL, (size_t) sysconf(_SC_PAGESIZE), PROT_READ, MAP_SHARED, clock->fd, 0);
+    if (page == MAP_FAILED) {
+        closeTaskClock(clock);
+        return false;
+    }
+    clock->page = page;
+
+    // The first read checks that user space can extrapolate the page.
+    uint64_t taskNow;
+    if (!readTaskClock(clock->page, &taskNow)) {
+        closeTaskClock(clock);
+        return false;
+    }
+    return true;
+}
+
+// The key's destructor, run by the exiting thread with the value it held: releases the carrier's
+// event and mapping, if it has them. It touches no JVM state, as the thread may already be
+// detached from the JVM.
+static void releaseTaskClock(void* value)
+{
+#if defined(VTHREADTIME_TEST_INITIALIZATION_FAULTS)
+    atomic_fetch_add_explicit(&testTaskClockReleaseCount, 1, memory_order_relaxed);
+#endif
+    TaskClock* clock = (TaskClock*) value;
+    if (clock == &taskClockUnavailable) {
+        return;
+    }
+    closeTaskClock(clock);
+    free(clock);
+}
+
+// The calling carrier's clock: NULL until the carrier tries the event, then its open clock or
+// taskClockUnavailable, which every carrier gets without the key. Never allocates or locks, so
+// critical downcalls may call it.
+static TaskClock* currentTaskClock(void)
+{
+    if (!atomic_load_explicit(&taskClockKeyCreated, memory_order_acquire)) {
+        return &taskClockUnavailable;
+    }
+    return (TaskClock*) pthread_getspecific(taskClockKey);
+}
+
+// Records that the calling carrier uses the thread CPU clock. Should the key refuse the value, the
+// carrier keeps answering through this path, which then finds the stopped flag set.
+static TaskClock* useThreadCpuClock(void)
+{
+    (void) pthread_setspecific(taskClockKey, &taskClockUnavailable);
+    return &taskClockUnavailable;
+}
+
+// Sets up the calling carrier's event on its first call. The clock is attached to the key before
+// any reading from it is returned, so the destructor always releases it.
+static TaskClock* openCurrentTaskClock(void)
+{
+    TaskClock* clock = currentTaskClock();
+    if (clock != NULL) {
+        return clock;
+    }
+    if (atomic_load_explicit(&taskClockStopped, memory_order_relaxed)) {
+        return useThreadCpuClock();
+    }
+    TaskClock opened;
+    if (openTaskClock(&opened)) {
+        clock = malloc(sizeof(*clock));
+        if (clock != NULL) {
+            *clock = opened;
+            if (pthread_setspecific(taskClockKey, clock) == 0) {
+                return clock;
+            }
+            free(clock);
+        }
+        closeTaskClock(&opened);
+    }
+    // Opening the first perf task-clock event patches kernel code on every CPU, so a failed setup,
+    // which has closed any event it opened, stops later carriers from trying. Carriers that already
+    // hold an event keep it, and first attempts already in flight may still finish.
+    atomic_store_explicit(&taskClockStopped, true, memory_order_relaxed);
+    return useThreadCpuClock();
+}
+#endif
+
+// The first call fixes the mode for the process; class loaders that initialize later reuse it.
+static void configurePerfClock(PerfClockMode mode)
+{
+#if defined(VTHREADTIME_PERF_TASK_CLOCK)
+    static bool configured = false;
+    (void) pthread_mutex_lock(&initializationMutex);
+    if (!configured) {
+        configured = true;
+        checkSeccomp = mode != PERF_CLOCK_ON;
+        if (mode == PERF_CLOCK_OFF) {
+            atomic_store_explicit(&taskClockStopped, true, memory_order_relaxed);
+        }
+        else if (pthread_key_create(&taskClockKey, releaseTaskClock) == 0) {
+            atomic_store_explicit(&taskClockKeyCreated, true, memory_order_release);
+        }
+        else {
+            // Without a key no carrier can keep an event, so every carrier uses the thread CPU clock.
+            atomic_store_explicit(&taskClockStopped, true, memory_order_relaxed);
+        }
+    }
+    (void) pthread_mutex_unlock(&initializationMutex);
+#else
+    (void) mode;
+#endif
+}
+
+typedef enum
+{
+    CARRIER_CLOCK_FAILED,
+    CARRIER_CLOCK_READ,
+    // Answering would mean setting up the carrier's event or reading its file descriptor.
+    CARRIER_CLOCK_WOULD_BLOCK,
+} CarrierClockRead;
+
+// Mounted time is the CPU time of the carrier thread, not wall time. A carrier that waits in the
+// OS run queue while a virtual thread is mounted on it must not charge that wait to the virtual
+// thread. Every caller runs on the carrier, so each start and end pair reads one carrier clock.
+//
+// This read never blocks, so critical downcalls may make it: it answers only from the mapped page
+// of a carrier on the task clock, or from the thread CPU clock on a carrier known to lack the event.
+static CarrierClockRead carrierCpuTimeNonBlocking(uint64_t* result)
+{
+#if defined(VTHREADTIME_PERF_TASK_CLOCK)
+    TaskClock* clock = currentTaskClock();
+    if (clock == NULL) {
+        return CARRIER_CLOCK_WOULD_BLOCK;
+    }
+    // A carrier leaves the task clock only when its thread exits, so no interval mixes the two
+    // clocks, which drift apart with every context switch.
+    if (clock != &taskClockUnavailable) {
+        return readTaskClock(clock->page, result) ? CARRIER_CLOCK_READ : CARRIER_CLOCK_WOULD_BLOCK;
+    }
+#endif
+    return threadCpuTime(result) ? CARRIER_CLOCK_READ : CARRIER_CLOCK_FAILED;
+}
+
+// The same clock for callers that may block: on its first read a carrier sets up the event, and
+// once the kernel withdraws cap_user_time, for example when the TSC becomes unstable, a carrier on
+// the task clock reads the same count through the file descriptor, which can wait on the kernel's
+// perf-context lock.
+static bool carrierCpuTime(uint64_t* result)
+{
+#if defined(VTHREADTIME_PERF_TASK_CLOCK)
+    TaskClock* clock = openCurrentTaskClock();
+    if (clock != &taskClockUnavailable) {
+        return readTaskClock(clock->page, result) || readTaskClockFile(clock->fd, result);
+    }
+#endif
+    return threadCpuTime(result);
 }
 
 // The JVM frees the new bytes with Deallocate, so they must be a fresh JVMTI allocation.
@@ -475,6 +853,23 @@ static int installHooksLocked(ClassDefinition hooks, ClassTransformer transforme
     return SUCCESS;
 }
 
+// Called before the hooks are installed, so the mode is in place before any carrier reads its clock.
+VTHREADTIME_EXPORT void airlift_vthreadtime_configure_perf_clock(int mode)
+{
+    configurePerfClock((PerfClockMode) mode);
+}
+
+// Whether the calling carrier reads its CPU clock from a perf task-clock event.
+VTHREADTIME_EXPORT int airlift_vthreadtime_uses_perf_clock(void)
+{
+#if defined(VTHREADTIME_PERF_TASK_CLOCK)
+    TaskClock* clock = currentTaskClock();
+    return clock != NULL && clock != &taskClockUnavailable;
+#else
+    return 0;
+#endif
+}
+
 // Defines the hook class into the bootstrap loader and retransforms java.lang.VirtualThread to
 // call it, once per process. The transformer runs on the calling thread while the mutex is held;
 // it must therefore not call back into this library.
@@ -502,8 +897,25 @@ VTHREADTIME_EXPORT int64_t airlift_vthreadtime_hooks_installed(void)
 }
 
 // The hook classes' clock, called through a critical downcall on every mount and unmount of a
-// registered thread, so it must neither block nor fail.
+// registered thread, so it must not block. Returns zero when the clock fails, and -1 when it cannot
+// answer without blocking; the hooks then call airlift_vthreadtime_carrier_cpu_nanos_blocking.
 VTHREADTIME_EXPORT int64_t airlift_vthreadtime_carrier_cpu_nanos(void)
+{
+    uint64_t nanos;
+    switch (carrierCpuTimeNonBlocking(&nanos)) {
+        case CARRIER_CLOCK_READ:
+            return (int64_t) nanos;
+        case CARRIER_CLOCK_WOULD_BLOCK:
+            return -1;
+        case CARRIER_CLOCK_FAILED:
+            break;
+    }
+    return 0;
+}
+
+// The same clock through a regular downcall, which may block: it sets up the event of a carrier
+// that has not tried it yet, or reads the event's file descriptor. Returns zero when the clock fails.
+VTHREADTIME_EXPORT int64_t airlift_vthreadtime_carrier_cpu_nanos_blocking(void)
 {
     uint64_t nanos;
     if (!carrierCpuTime(&nanos)) {
@@ -511,3 +923,11 @@ VTHREADTIME_EXPORT int64_t airlift_vthreadtime_carrier_cpu_nanos(void)
     }
     return (int64_t) nanos;
 }
+
+#if defined(VTHREADTIME_TEST_INITIALIZATION_FAULTS)
+// How many exiting threads have run the destructor of the task clock key.
+VTHREADTIME_EXPORT int64_t airlift_vthreadtime_test_task_clock_release_count(void)
+{
+    return (int64_t) atomic_load_explicit(&testTaskClockReleaseCount, memory_order_relaxed);
+}
+#endif

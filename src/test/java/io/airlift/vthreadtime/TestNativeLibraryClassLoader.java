@@ -14,6 +14,9 @@
 package io.airlift.vthreadtime;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
+import org.junit.jupiter.api.condition.EnabledOnOs;
+import org.junit.jupiter.api.condition.OS;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.File;
@@ -48,6 +51,7 @@ import java.util.jar.JarEntry;
 import java.util.jar.JarOutputStream;
 import java.util.jar.Manifest;
 import java.util.spi.ToolProvider;
+import java.util.stream.Stream;
 
 import static java.lang.foreign.ValueLayout.JAVA_LONG;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -57,6 +61,9 @@ class TestNativeLibraryClassLoader
     private static final String INITIALIZATION_FAULT_ENVIRONMENT = "VTHREADTIME_TEST_INITIALIZATION_FAULT";
     private static final String LIBRARY_PATH_PROPERTY = "io.airlift.vthreadtime.library.path";
     private static final String TEMP_DIRECTORY_PROPERTY = "io.airlift.vthreadtime.tmpdir";
+    private static final String PERF_CLOCK_PROPERTY = "io.airlift.vthreadtime.perf.clock";
+    // See TestVirtualThreadTime
+    private static final String PERF_CLOCK_SUPPORTED_PROPERTY = "io.airlift.vthreadtime.test.perf.clock.supported";
     private static final String PARALLELISM_PROPERTY = "jdk.virtualThreadScheduler.parallelism";
     private static final List<String> NATIVE_ACCESS_OPTIONS = List.of("--enable-native-access=ALL-UNNAMED", "--illegal-native-access=deny");
     // Default maximum pool size of the virtual thread scheduler; parallelism above it is rejected
@@ -149,6 +156,21 @@ class TestNativeLibraryClassLoader
     }
 
     @Test
+    void testInvalidPerfClockModeIsUnsupported(@TempDir Path temporaryDirectory)
+            throws Exception
+    {
+        runSubprocess("invalid-perf-clock", temporaryDirectory, Optional.empty(), Optional.empty(), List.of("-D" + PERF_CLOCK_PROPERTY + "=fast"));
+    }
+
+    @Test
+    @EnabledIfSystemProperty(named = PERF_CLOCK_SUPPORTED_PROPERTY, matches = "true")
+    void testPerfClockOffUsesThreadCpuClock(@TempDir Path temporaryDirectory)
+            throws Exception
+    {
+        runSubprocess("perf-clock-off", temporaryDirectory, Optional.empty(), Optional.empty(), List.of("-D" + PERF_CLOCK_PROPERTY + "=off"));
+    }
+
+    @Test
     void testHooksFailureIsLatchedProcessWide(@TempDir Path temporaryDirectory)
             throws Exception
     {
@@ -163,6 +185,20 @@ class TestNativeLibraryClassLoader
                     Optional.of(fault),
                     List.of());
         }
+    }
+
+    @Test
+    @EnabledOnOs(value = OS.LINUX, disabledReason = "Only Linux carriers hold a perf task clock")
+    void testExitingCarrierReleasesTaskClockInHooksMode(@TempDir Path temporaryDirectory)
+            throws Exception
+    {
+        Path faultLibrary = buildTestNativeLibrary(
+                temporaryDirectory.resolve("fixture"),
+                "--test-initialization-faults");
+        runSubprocess(
+                "carrier-release",
+                Files.createDirectory(temporaryDirectory.resolve("load")),
+                Optional.of(faultLibrary));
     }
 
     @Test
@@ -248,7 +284,10 @@ class TestNativeLibraryClassLoader
                 Optional.empty(),
                 List.of(
                         "-D" + PARALLELISM_PROPERTY + "=" + carriers,
-                        "-Djdk.virtualThreadScheduler.maxPoolSize=" + carriers));
+                        "-Djdk.virtualThreadScheduler.maxPoolSize=" + carriers,
+                        // The sum is checked against process CPU time, which a perf task clock
+                        // would exceed by the steal time it counts
+                        "-D" + PERF_CLOCK_PROPERTY + "=off"));
     }
 
     @Test
@@ -475,9 +514,17 @@ class TestNativeLibraryClassLoader
                 }
                 case "hooks-failure" -> testHooksFailure(libraryClasses, System.getenv(INITIALIZATION_FAULT_ENVIRONMENT));
                 case "carrier-cpu" -> testCarrierCpuTime();
+                case "carrier-release" -> testCarrierRelease();
+                case "perf-clock-off" -> testPerfClockOff();
                 case "foreign-retransform" -> testForeignRetransformation(libraryClasses);
                 case "aot-training" -> testAotTraining();
                 case "aot-production" -> testAotProduction();
+                case "invalid-perf-clock" -> {
+                    WeakReference<ClassLoader> loader = verifyExpectedFailureAndRelease(libraryClasses, "Unknown " + PERF_CLOCK_PROPERTY + ": fast", false);
+                    awaitCollected(List.of(loader));
+                    // The value is rejected before the native library is extracted
+                    verifyPublishedLibraryCount(0);
+                }
                 default -> throw new IllegalArgumentException("Unknown mode: " + mode);
             }
         }
@@ -526,6 +573,91 @@ class TestNativeLibraryClassLoader
             if (mountedNanos.get() < cpuNanos / 2) {
                 throw new AssertionError("Mounted time %s ns is below half the process CPU time %s ns"
                         .formatted(mountedNanos.get(), cpuNanos));
+            }
+        }
+
+        private static void testCarrierRelease()
+                throws Exception
+        {
+            // Every thread that reads its carrier clock keeps the clock until the thread exits,
+            // whether it holds a perf event or uses the thread CPU clock, so each exit runs the
+            // release once, and the release gives back the event's descriptor and mapping. The
+            // release runs after join returns, as the native thread winds down.
+            VirtualThreadTime.initialize();
+            verifyStatus(VirtualThreadTime.Status.ACTIVE);
+            int carriers = 4;
+            long releasedBefore = readPublishedValue("airlift_vthreadtime_test_task_clock_release_count");
+            long perfEventsBefore = perfEventResources();
+            AtomicReference<Throwable> failure = new AtomicReference<>();
+            for (int index = 0; index < carriers; index++) {
+                Thread.ofPlatform().start(() -> {
+                    try {
+                        readPublishedValue("airlift_vthreadtime_carrier_cpu_nanos_blocking");
+                    }
+                    catch (Throwable throwable) {
+                        failure.set(throwable);
+                    }
+                }).join();
+            }
+            if (failure.get() != null) {
+                throw new AssertionError("Carrier clock read failed", failure.get());
+            }
+
+            long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+            long released;
+            while ((released = readPublishedValue("airlift_vthreadtime_test_task_clock_release_count") - releasedBefore) < carriers
+                    || perfEventResources() > perfEventsBefore) {
+                if (System.nanoTime() > deadline) {
+                    throw new AssertionError("%s of %s exited carriers released their clock, %s perf event descriptors and mappings remain"
+                            .formatted(released, carriers, perfEventResources() - perfEventsBefore));
+                }
+                Thread.sleep(Duration.ofMillis(10));
+            }
+        }
+
+        /// Open perf event descriptors and mappings of this process.
+        private static long perfEventResources()
+                throws IOException
+        {
+            long mappings = Files.readAllLines(Path.of("/proc/self/maps")).stream()
+                    .filter(line -> line.endsWith("anon_inode:[perf_event]"))
+                    .count();
+            try (Stream<Path> descriptors = Files.list(Path.of("/proc/self/fd"))) {
+                return mappings + descriptors
+                        .filter(descriptor -> linkTarget(descriptor).equals("anon_inode:[perf_event]"))
+                        .count();
+            }
+        }
+
+        private static String linkTarget(Path descriptor)
+        {
+            try {
+                return Files.readSymbolicLink(descriptor).toString();
+            }
+            catch (IOException _) {
+                return "";
+            }
+        }
+
+        private static void testPerfClockOff()
+                throws Exception
+        {
+            // On a host where carriers can use the perf task clock, off keeps them on the thread
+            // CPU clock.
+            VirtualThreadTime.initialize();
+            AtomicReference<Throwable> failure = new AtomicReference<>();
+            Thread.ofVirtual().start(() -> {
+                try (VirtualThreadTime _ = VirtualThreadTime.register()) {
+                    if (NativeAccess.usesPerfClock()) {
+                        throw new AssertionError("Carrier uses the perf clock with %s=off".formatted(PERF_CLOCK_PROPERTY));
+                    }
+                }
+                catch (Throwable throwable) {
+                    failure.set(throwable);
+                }
+            }).join();
+            if (failure.get() != null) {
+                throw new AssertionError("Registered thread failed", failure.get());
             }
         }
 

@@ -46,10 +46,16 @@ public final class VirtualThreadHooks
     private static final int TRACKER_SIZE = 5;
 
     private static final MethodType CLOCK_TYPE = methodType(long.class);
+    // A clock reading that asks for the fallback clock instead; see setClock
+    private static final long USE_FALLBACK = -1;
+    private static final MethodHandle USE_CLOCK_READING = MethodHandles.identity(long.class);
     private static final ThreadLocal<long[]> TRACKER = new ThreadLocal<>();
+    // The clock with its fallback folded in, so a reader sees either the default pair or the
+    // installed one, never one of each
     private static final MutableCallSite CLOCK_SITE = new MutableCallSite(systemNanoTime());
     private static final MethodHandle CLOCK = CLOCK_SITE.dynamicInvoker();
     private static final Object CLOCK_LOCK = new Object();
+    // Guarded by CLOCK_LOCK
     private static boolean clockInstalled;
 
     // Set once by the first registration and never cleared. Until then no thread has a tracker,
@@ -167,30 +173,36 @@ public final class VirtualThreadHooks
         return tracker[UNMOUNT_COUNT];
     }
 
-    /// Installs the clock that stamps mounts and unmounts. The handle must take no arguments
-    /// and return the current time in nanoseconds. The first call wins: it installs the
-    /// clock and returns `true`; every later call is ignored and returns `false`. The default
-    /// clock is [System#nanoTime()].
+    /// Installs the clock that stamps mounts and unmounts. Both handles must take no arguments
+    /// and return the current time in nanoseconds on the same scale. A reading of -1 from
+    /// `clock` means it cannot answer cheaply right now, and the hooks read `fallback` instead;
+    /// this lets `clock` be a critical downcall that must not block. The first call wins: it
+    /// installs both and returns `true`; every later call is ignored and returns `false`. The
+    /// default for both is [System#nanoTime()].
     ///
     /// Call this before any thread registers: trackers stamp intervals with whichever clock
     /// is installed at the time, and readings from different clocks cannot be combined.
     ///
-    /// @throws IllegalArgumentException if the handle does not have type `()long`
-    public static boolean setClock(MethodHandle clock)
+    /// @throws IllegalArgumentException if a handle does not have type `()long`
+    public static boolean setClock(MethodHandle clock, MethodHandle fallback)
     {
         requireNonNull(clock, "clock is null");
+        requireNonNull(fallback, "fallback is null");
         if (!clock.type().equals(CLOCK_TYPE)) {
             throw new IllegalArgumentException("clock must have type " + CLOCK_TYPE + " but has " + clock.type());
         }
-        // Under one lock so that a loser returns only after the winner's clock is in place, and
-        // its first registration cannot stamp with the default clock
+        if (!fallback.type().equals(CLOCK_TYPE)) {
+            throw new IllegalArgumentException("fallback must have type " + CLOCK_TYPE + " but has " + fallback.type());
+        }
+        // A later caller waits here until the first has installed its pair, so it never registers
+        // threads against the default clock, nor against the winner's clock with the default fallback
         synchronized (CLOCK_LOCK) {
             if (clockInstalled) {
                 return false;
             }
-            clockInstalled = true;
-            CLOCK_SITE.setTarget(clock);
+            CLOCK_SITE.setTarget(withFallback(clock, fallback));
             MutableCallSite.syncAll(new MutableCallSite[] {CLOCK_SITE});
+            clockInstalled = true;
             return true;
         }
     }
@@ -207,9 +219,9 @@ public final class VirtualThreadHooks
         return Math.max(0, now() - started);
     }
 
-    /// Reads the installed clock. Never throws: the call site is constant, so the JIT inlines
-    /// the clock into the hooks, and a failing clock reads as zero instead of unwinding
-    /// through `VirtualThread.mount()`.
+    /// Reads the installed clock, or its fallback when the clock asks for it. Never throws: the
+    /// call site is constant, so the JIT inlines the clock into the hooks, and a failing clock
+    /// reads as zero instead of unwinding through `VirtualThread.mount()`.
     static long now()
     {
         try {
@@ -220,6 +232,22 @@ public final class VirtualThreadHooks
         }
     }
 
+    /// `clock`, with a reading of [#USE_FALLBACK] replaced by a reading of `fallback`.
+    private static MethodHandle withFallback(MethodHandle clock, MethodHandle fallback)
+    {
+        MethodHandle select = MethodHandles.guardWithTest(
+                findStatic("isUseFallback", methodType(boolean.class, long.class)),
+                MethodHandles.dropArguments(fallback, 0, long.class),
+                USE_CLOCK_READING);
+        return MethodHandles.filterReturnValue(clock, select);
+    }
+
+    // Reached through withFallback's method handle
+    static boolean isUseFallback(long reading)
+    {
+        return reading == USE_FALLBACK;
+    }
+
     private static MethodHandle systemNanoTime()
     {
         try {
@@ -227,6 +255,16 @@ public final class VirtualThreadHooks
         }
         catch (ReflectiveOperationException exception) {
             throw new ExceptionInInitializerError(exception);
+        }
+    }
+
+    private static MethodHandle findStatic(String name, MethodType type)
+    {
+        try {
+            return MethodHandles.lookup().findStatic(VirtualThreadHooks.class, name, type);
+        }
+        catch (ReflectiveOperationException exception) {
+            throw new IllegalStateException(exception);
         }
     }
 }
