@@ -41,8 +41,9 @@ mounted on it. Time spent unmounted while sleeping, parking, or waiting for I/O
 is excluded. So is time the carrier spends off the CPU while the virtual thread
 is mounted: waiting in the OS run queue when the scheduler has more carriers
 than cores, or blocked while the virtual thread is pinned. Kernel time spent on
-behalf of the virtual thread is included. A tracker is confined to the virtual
-thread that registered it.
+behalf of the virtual thread is included, and so is steal time a hypervisor
+reports, on Linux carriers that read the perf task-clock event described below.
+A tracker is confined to the virtual thread that registered it.
 
 ## Mechanism
 
@@ -92,6 +93,47 @@ removes it, at the price of JVMTI no longer reporting virtual threads to any
 agent or debugger in that JVM; the hooks do not need those events and then
 measure at close to the cost of a bare transition.
 
+### Carrier CPU clock on Linux
+
+On Linux, reading a thread's CPU clock is a system call, not a vDSO read. Each
+carrier therefore opens a perf task-clock event for itself the first time it
+reads its clock, maps the event's page, and from then on reads the clock from
+that page without a system call. The event counts the time the carrier is
+scheduled on a CPU, including kernel time and, where the hypervisor reports it,
+steal time, which the system call leaves out. Each such carrier holds one perf
+file descriptor and one page charged to the user's perf locked-memory limit
+until its thread exits.
+
+A carrier can use the perf task-clock event only when:
+
+- it may open the event: `perf_event_paranoid` at 2 or lower, as on Amazon
+  Linux 2023, `CAP_PERFMON` on Ubuntu 24.04, or `CAP_SYS_ADMIN` on the tested
+  Debian 12 kernel;
+- the kernel publishes timing data for user-space extrapolation
+  (`cap_user_time`). Graviton does; x86 KVM guests using kvm-clock, the EC2
+  Intel default, do not; Intel with a native scheduler clock, on bare metal or
+  booted with `no-kvmclock`, can;
+- no seccomp filter applies to it, by default. Some filters kill the process
+  instead of failing the call, such as systemd's `SystemCallFilter=` without
+  `SystemCallErrorNumber=`, so a carrier tries the event only when its
+  `/proc/thread-self/status` reports no seccomp filter. With
+  `io.airlift.vthreadtime.perf.clock=on`, a filter that allows
+  `perf_event_open` also works, such as Docker's default profile with
+  `--cap-add PERFMON`.
+
+After the first carrier fails to set up the event, no later carrier tries.
+Carriers without an event read the thread CPU clock with a system call. The
+property `io.airlift.vthreadtime.perf.clock`, described under
+[Dependency](#dependency), selects whether carriers try the event.
+
+The two clocks do not agree exactly. Measured on AWS Graviton4, the perf
+task-clock event differed from the thread CPU clock by about 0.2–0.3 µs per
+time-slice switch, and read up to about 0.85 µs per switch lower under
+frequent wakeup preemption: 0.8% of the CPU time of a thread sharing its CPU
+with a task that woke every 50 µs. If native code on a carrier disables its
+perf events with `prctl(PR_TASK_PERF_EVENTS_DISABLE)`, later readings on that
+carrier also count time off the CPU, which the library cannot detect.
+
 ## Runtime overhead
 
 After the first successful initialization:
@@ -114,18 +156,29 @@ After the first successful initialization:
   transitions grows, and it is most visible in transition-only loops. Merely
   adding the library to the class path or module path has no effect.
 
-- **Memory:** No native memory per thread. A virtual thread that uses thread
-  locals but is not registered gets one empty thread-local entry of about 40
-  bytes on its first mount.
+- **Memory:** No native memory per virtual thread. A virtual thread that uses
+  thread locals but is not registered gets one empty thread-local entry of
+  about 40 bytes on its first mount. On Linux, each carrier that reads the perf
+  task-clock event also holds a small allocation, a file descriptor and a
+  locked page until its thread exits.
 
 - **Registered threads:** The hooks read the carrier thread's CPU clock at
-  each mount and unmount, and `mountedTimeNanos()` reads it once more. On Linux
-  that clock is not served from the vDSO, so each read is a system call. In a
-  Linux aarch64 virtual machine it took about 130 ns against 11 ns for the
-  monotonic clock, so a registered thread paid about 290 ns more per cycle than
-  an unregistered one and a `mountedTimeNanos()` call about 140 ns. On EC2,
-  registering and closing a short-lived virtual thread costs 0.5–0.9 µs of CPU,
-  against about 3 µs with the events of release 1.1.
+  each mount and unmount, and `mountedTimeNanos()` reads it once more. On hosts
+  where carriers read the perf task-clock event, such as AWS Graviton, this
+  costs a fraction of the system call. On Graviton5 in November 2026, against
+  the same build with the event turned off:
+
+  | Graviton5 (c9g) | Perf task-clock event | System call |
+  | --- | ---: | ---: |
+  | Tracking, per mount/unmount cycle | 56 ns | 327 ns |
+  | `mountedTimeNanos()` call | 31 ns | 167 ns |
+  | Tracking, per park in the blocked-handoff benchmark | not measurable | 0.1 µs |
+
+  Where carriers read the thread CPU clock with a system call, as on AWS Intel
+  with kvm-clock, tracking costs about 340–400 ns per cycle and a
+  `mountedTimeNanos()` call about 150 ns. On EC2, registering and closing a
+  short-lived virtual thread costs 0.5–0.9 µs of CPU, against about 3 µs with
+  the events of release 1.1.
 
 - **Pathological transition rates:** The problematic cases remain loops that
   repeatedly call `Thread.yield()` or `parkNanos()` with almost no useful work
@@ -135,7 +188,8 @@ After the first successful initialization:
 
 All of these measurements are described in
 [Measuring runtime overhead](docs/measuring-overhead.md), including the
-release 1.1 numbers for the JVMTI events the hooks replaced.
+November 2026 perf task-clock measurements on AWS Graviton5, Graviton4 and
+Intel and the release 1.1 numbers for the JVMTI events the hooks replaced.
 
 ## Requirements
 
@@ -161,7 +215,7 @@ Virtual Thread Time:
 ```
 
 Linux and macOS 15 or newer are supported on `aarch64` and `x86_64`. Linux
-artifacts target glibc-based distributions and dynamically link the host's
+artifacts require glibc 2.17 or later and dynamically link the host's
 standard C runtime libraries; musl-based distributions such as Alpine Linux
 are not supported. Other operating systems and architectures are unsupported.
 On those platforms, or when the native library cannot be loaded,
@@ -192,10 +246,18 @@ loaders do not retry. No `-agentpath` JVM option is required.
 The system property `io.airlift.vthreadtime.library.path` can specify an
 explicit native library instead of loading the packaged resource. The system
 property `io.airlift.vthreadtime.tmpdir` can select the extraction directory
-when the default `java.io.tmpdir` does not permit executable mappings. Native
-library and temporary-directory properties must be configured before the first
-use of Virtual Thread Time and must not be changed afterward; this includes
-`java.io.tmpdir` when no custom extraction directory is configured.
+when the default `java.io.tmpdir` does not permit executable mappings. The
+system property `io.airlift.vthreadtime.perf.clock` controls the perf
+task-clock event on Linux: `auto`, the default, tries it only on carriers with
+no seccomp filter; `on` also tries it under a seccomp filter, such as Docker's
+default profile with `--cap-add PERFMON`, and must not be used where a filter
+kills the process on `perf_event_open`; `off` never opens a perf event. With
+`on`, a failure to open the event still falls back to the system call. Any other
+value makes initialization fail on every platform, so
+`VirtualThreadTime.isSupported()` returns `false`. These properties must be
+configured before the first use of Virtual Thread Time and must not be changed
+afterward; this includes `java.io.tmpdir` when no custom extraction directory
+is configured.
 
 All class loaders rendezvous through a predictable process-specific directory
 inside the configured extraction root. The loader rejects a precreated
@@ -208,8 +270,15 @@ a directory owned by the application user with `0700` permissions.
 
 ## Building
 
-A C23 compiler and a Java 25 JDK are required:
+A C23 compiler, a Java 25 JDK, and on Linux, kernel headers 5.9 or later are
+required:
 
 ```bash
 ./mvnw clean install
 ```
+
+A library built this way requires the build host's glibc or newer. Release
+builds compile the Linux libraries with the gcc of PyPA's manylinux2014 image,
+which links against glibc 2.17, using the `perf_event.h` of Linux 6.12 because
+the image's kernel headers are older. CI checks that each library loads on
+CentOS 7; see `.github/workflows/native-build.yml`.

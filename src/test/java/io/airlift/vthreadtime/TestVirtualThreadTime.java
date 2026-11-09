@@ -14,6 +14,7 @@
 package io.airlift.vthreadtime;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 
 import java.time.Duration;
 import java.util.ArrayList;
@@ -27,6 +28,13 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class TestVirtualThreadTime
 {
+    // Set on hosts known to allow user-space reads of a perf task-clock event, which run the tests
+    // that need one with ./mvnw verify -Dio.airlift.vthreadtime.test.perf.clock.supported=true. The
+    // host must let the user open the event (perf_event_paranoid or a capability), must offer
+    // cap_user_time, and must run the JVM with no seccomp filter, as the default auto mode requires;
+    // a default Docker container has one.
+    private static final String PERF_CLOCK_SUPPORTED_PROPERTY = "io.airlift.vthreadtime.test.perf.clock.supported";
+
     @Test
     void testSupported()
     {
@@ -120,6 +128,20 @@ class TestVirtualThreadTime
 
         assertThat(measurement.mountedNanos())
                 .isLessThanOrEqualTo(measurement.wallNanos() + Duration.ofMillis(1).toNanos());
+    }
+
+    @Test
+    @EnabledIfSystemProperty(named = PERF_CLOCK_SUPPORTED_PROPERTY, matches = "true")
+    void testCarrierUsesPerfClock()
+            throws Exception
+    {
+        boolean usesPerfClock = onVirtualThread(() -> {
+            try (VirtualThreadTime _ = VirtualThreadTime.register()) {
+                return NativeAccess.usesPerfClock();
+            }
+        });
+
+        assertThat(usesPerfClock).isTrue();
     }
 
     @Test

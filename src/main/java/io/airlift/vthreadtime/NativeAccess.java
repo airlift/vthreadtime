@@ -27,6 +27,7 @@ import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
 import java.lang.management.ManagementFactory;
+import java.util.Locale;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static java.lang.foreign.Linker.Option.critical;
@@ -41,11 +42,14 @@ import static java.util.Objects.requireNonNull;
 /// hook class behind exact-typed method handles.
 final class NativeAccess
 {
+    private static final String PERF_CLOCK_PROPERTY = "io.airlift.vthreadtime.perf.clock";
+
     // The hook class is defined into the bootstrap loader at runtime, so this class must only
     // ever reach it by name through that loader, never as a compile-time reference.
     private static final String HOOKS_CLASS = "io.airlift.vthreadtime.hook.VirtualThreadHooks";
 
     private static final MethodHandle HOOKS_INSTALLED;
+    private static final MethodHandle USES_PERF_CLOCK;
     private static final HookHandles HOOKS;
     private static final boolean AOT_TRAINING;
     private static final Throwable INITIALIZATION_FAILURE;
@@ -59,10 +63,13 @@ final class NativeAccess
 
     static {
         MethodHandle hooksInstalled = null;
+        MethodHandle usesPerfClock = null;
         HookHandles hooks = null;
         boolean aotTraining = false;
         Throwable initializationFailure = null;
         try {
+            // Validated even when the library is not loaded, so a bad value fails everywhere
+            int perfClockMode = configuredPerfClockMode();
             aotTraining = isAotTrainingRun();
             if (!aotTraining) {
                 Linker linker = Linker.nativeLinker();
@@ -71,21 +78,33 @@ final class NativeAccess
                         symbols.findOrThrow("airlift_vthreadtime_carrier_cpu_nanos"),
                         FunctionDescriptor.of(JAVA_LONG),
                         critical(false));
+                // Answers when the critical clock cannot without blocking; see VirtualThreadHooks.now()
+                MethodHandle carrierCpuNanosBlocking = linker.downcallHandle(
+                        symbols.findOrThrow("airlift_vthreadtime_carrier_cpu_nanos_blocking"),
+                        FunctionDescriptor.of(JAVA_LONG));
+                MethodHandle configurePerfClock = linker.downcallHandle(
+                        symbols.findOrThrow("airlift_vthreadtime_configure_perf_clock"),
+                        FunctionDescriptor.ofVoid(JAVA_INT));
+                usesPerfClock = linker.downcallHandle(
+                        symbols.findOrThrow("airlift_vthreadtime_uses_perf_clock"),
+                        FunctionDescriptor.of(JAVA_INT));
                 hooksInstalled = linker.downcallHandle(
                         symbols.findOrThrow("airlift_vthreadtime_hooks_installed"),
                         FunctionDescriptor.of(JAVA_LONG),
                         critical(false));
+                configurePerfClock.invokeExact(perfClockMode);
                 int status = installHooks(linker, symbols);
                 if (status != 0) {
                     throw new UnsupportedOperationException("Hooks installation failed: " + statusMessage(status), TRANSFORM_FAILURE.get());
                 }
-                hooks = resolveHooks(carrierCpuNanos);
+                hooks = resolveHooks(carrierCpuNanos, carrierCpuNanosBlocking);
             }
         }
         catch (Throwable throwable) {
             initializationFailure = throwable;
         }
         HOOKS_INSTALLED = hooksInstalled;
+        USES_PERF_CLOCK = usesPerfClock;
         HOOKS = hooks;
         AOT_TRAINING = aotTraining;
         INITIALIZATION_FAILURE = initializationFailure;
@@ -140,6 +159,18 @@ final class NativeAccess
         return invokeLong(HOOKS_INSTALLED) != 0;
     }
 
+    /// Returns whether the carrier of the current virtual thread reads its CPU clock from a perf
+    /// task-clock event instead of the thread CPU clock.
+    static boolean usesPerfClock()
+    {
+        try {
+            return (int) USES_PERF_CLOCK.invokeExact() != 0;
+        }
+        catch (Throwable throwable) {
+            throw new IllegalStateException("Native call failed", throwable);
+        }
+    }
+
     /// Whether this JVM is recording an AOT cache. Retransforming `VirtualThread` would exclude it
     /// from the cache as redefined, and HotSpot refuses to write a cache without that critical
     /// class, so the training run would exit with a failure and the production run start without
@@ -160,6 +191,18 @@ final class NativeAccess
         catch (IllegalArgumentException unknownOption) {
             return "";
         }
+    }
+
+    // Values match PerfClockMode in vthreadtime.c
+    private static int configuredPerfClockMode()
+    {
+        String value = System.getProperty(PERF_CLOCK_PROPERTY, "auto");
+        return switch (value.toLowerCase(Locale.ROOT)) {
+            case "auto" -> 0;
+            case "on" -> 1;
+            case "off" -> 2;
+            default -> throw new IllegalArgumentException("Unknown %s: %s".formatted(PERF_CLOCK_PROPERTY, value));
+        };
     }
 
     /// Defines the hook class into the bootstrap loader, initializes it there on the installing
@@ -212,7 +255,7 @@ final class NativeAccess
         }
     }
 
-    private static HookHandles resolveHooks(MethodHandle carrierCpuNanos)
+    private static HookHandles resolveHooks(MethodHandle carrierCpuNanos, MethodHandle carrierCpuNanosBlocking)
             throws Throwable
     {
         Class<?> hooks = Class.forName(HOOKS_CLASS, true, null);
@@ -222,9 +265,9 @@ final class NativeAccess
 
         // The clock must be in place before the first registration; later class loaders calling
         // this again are ignored by the hooks.
-        MethodHandle setClock = lookup.findStatic(hooks, "setClock", methodType(boolean.class, MethodHandle.class))
-                .asType(methodType(void.class, MethodHandle.class));
-        setClock.invokeExact(carrierCpuNanos);
+        MethodHandle setClock = lookup.findStatic(hooks, "setClock", methodType(boolean.class, MethodHandle.class, MethodHandle.class))
+                .asType(methodType(void.class, MethodHandle.class, MethodHandle.class));
+        setClock.invokeExact(carrierCpuNanos, carrierCpuNanosBlocking);
 
         // The tracker travels as Object so that the handles share one invoker; unregister and
         // dropOpenInterval return nothing, which asType turns into a zero.

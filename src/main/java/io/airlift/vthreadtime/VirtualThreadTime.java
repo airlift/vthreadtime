@@ -96,7 +96,10 @@ public final class VirtualThreadTime
     ///
     /// Mounted time is the CPU time of the carrier thread while this virtual thread is mounted
     /// on it. Time the carrier spends off the CPU, such as waiting in the OS run queue, is not
-    /// counted. The total stops growing once the hooks are removed; see [Status#HOOKS_REMOVED].
+    /// counted, except that on Linux carriers reading a perf task-clock event also count the
+    /// steal time a hypervisor reports. If the kernel stops user-space reads of that event, a
+    /// sample can leave out the open interval and read lower than an earlier one. The total stops
+    /// growing once the hooks are removed; see [Status#HOOKS_REMOVED].
     ///
     /// @throws IllegalStateException if called from another thread or after [#close()]
     public long mountedTimeNanos()
