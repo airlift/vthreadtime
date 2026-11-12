@@ -13,5 +13,8 @@
  */
 
 module io.airlift.vthreadtime {
+    // HotSpotDiagnosticMXBean, to recognize an AOT cache training run
+    requires jdk.management;
+
     exports io.airlift.vthreadtime;
 }

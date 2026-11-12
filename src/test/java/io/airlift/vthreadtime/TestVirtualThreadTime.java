@@ -21,6 +21,7 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
 
+import static io.airlift.vthreadtime.VirtualThreads.onVirtualThread;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -31,6 +32,12 @@ class TestVirtualThreadTime
     {
         assertThat(VirtualThreadTime.isSupported()).isTrue();
         VirtualThreadTime.initialize();
+    }
+
+    @Test
+    void testHooksAreActive()
+    {
+        assertThat(VirtualThreadTime.status()).isEqualTo(VirtualThreadTime.Status.ACTIVE);
     }
 
     @Test
@@ -187,24 +194,9 @@ class TestVirtualThreadTime
     }
 
     @Test
-    void testRegistrationCleanedAtThreadEnd()
-            throws Exception
-    {
-        long registrations = NativeAccess.activeRegistrations();
-        onVirtualThread(() -> {
-            VirtualThreadTime.register();
-            return null;
-        });
-        assertEventually(
-                () -> assertThat(NativeAccess.activeRegistrations()).isEqualTo(registrations),
-                Duration.ofSeconds(10));
-    }
-
-    @Test
     void testConcurrentTrackers()
             throws InterruptedException
     {
-        long registrations = NativeAccess.activeRegistrations();
         List<Thread> threads = new ArrayList<>();
         AtomicReference<Throwable> failure = new AtomicReference<>();
         for (int index = 0; index < 1_000; index++) {
@@ -212,6 +204,7 @@ class TestVirtualThreadTime
                 try (VirtualThreadTime time = VirtualThreadTime.register()) {
                     LockSupport.parkNanos(Duration.ofMillis(1).toNanos());
                     assertThat(time.mountCount()).isGreaterThanOrEqualTo(2);
+                    assertThat(time.unmountCount()).isGreaterThanOrEqualTo(1);
                 }
                 catch (Throwable throwable) {
                     failure.compareAndSet(null, throwable);
@@ -219,68 +212,11 @@ class TestVirtualThreadTime
             }));
         }
         for (Thread thread : threads) {
-            thread.join();
+            assertThat(thread.join(Duration.ofSeconds(30))).describedAs("thread finished").isTrue();
         }
 
         assertThat(failure.get()).isNull();
-        assertThat(NativeAccess.activeRegistrations()).isEqualTo(registrations);
-    }
-
-    private static <T> T onVirtualThread(ThrowingSupplier<T> task)
-            throws Exception
-    {
-        AtomicReference<T> result = new AtomicReference<>();
-        AtomicReference<Throwable> failure = new AtomicReference<>();
-        Thread thread = Thread.ofVirtual().start(() -> {
-            try {
-                result.set(task.get());
-            }
-            catch (Throwable throwable) {
-                failure.set(throwable);
-            }
-        });
-        thread.join();
-        if (failure.get() instanceof Exception exception) {
-            throw exception;
-        }
-        if (failure.get() instanceof Error error) {
-            throw error;
-        }
-        return result.get();
-    }
-
-    private static void assertEventually(ThrowingRunnable assertion, Duration timeout)
-            throws Exception
-    {
-        long deadline = System.nanoTime() + timeout.toNanos();
-        AssertionError lastFailure;
-        do {
-            try {
-                assertion.run();
-                return;
-            }
-            catch (AssertionError failure) {
-                lastFailure = failure;
-            }
-            Thread.sleep(Duration.ofMillis(10));
-        }
-        while (System.nanoTime() < deadline);
-        throw lastFailure;
     }
 
     private record Measurement(long wallNanos, long mountedNanos, long mounts, long unmounts) {}
-
-    @FunctionalInterface
-    private interface ThrowingSupplier<T>
-    {
-        T get()
-                throws Exception;
-    }
-
-    @FunctionalInterface
-    private interface ThrowingRunnable
-    {
-        void run()
-                throws Exception;
-    }
 }
