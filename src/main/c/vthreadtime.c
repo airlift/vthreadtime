@@ -571,7 +571,13 @@ static void JNICALL onClassFileLoadHook(
         capturedClassDataLength = classDataLength;
     }
     else if (phase == HOOK_PHASE_APPLY) {
-        if (classData == NULL || classDataLength <= 0) {
+        // The applying pass must see the bytes the transformer was given. An environment ahead of
+        // this one that changed its output in between would otherwise lose its change, and its
+        // new output would pass as the hooked baseline; nothing is served then and the
+        // installation fails.
+        if (classData == NULL ||
+                classDataLength != capturedClassDataLength ||
+                memcmp(classData, capturedClassData, (size_t) classDataLength) != 0) {
             return;
         }
         unsigned char* input = malloc((size_t) classDataLength);
@@ -754,8 +760,9 @@ static int retransformVirtualThread(JNIEnv* jni, jvmtiEnv* jvmti, ClassTransform
         return RETRANSFORM_FAILED;
     }
     // From here on every class loaded anywhere in the process posts the event, at the cost of the
-    // name comparison in the callback. It stays enabled once the hooks are installed so that they
-    // survive later retransformations by other agents; see installedClassData.
+    // name comparison in the callback and, for a class loaded from a CDS archive, of HotSpot
+    // reading the original class bytes to post them. It stays enabled once the hooks are installed
+    // so that they survive later retransformations by other agents; see installedClassData.
     if ((*jvmti)->SetEventNotificationMode(jvmti, JVMTI_ENABLE, JVMTI_EVENT_CLASS_FILE_LOAD_HOOK, NULL) != JVMTI_ERROR_NONE) {
         return JVMTI_UNAVAILABLE;
     }
@@ -791,16 +798,16 @@ static int retransformVirtualThread(JNIEnv* jni, jvmtiEnv* jvmti, ClassTransform
         }
     }
 
-    free(capturedClassData);
-    capturedClassData = NULL;
-    capturedClassDataLength = 0;
-
+    // The applying callback compares its input with the captured bytes, so they live until it ran
     if (status == SUCCESS) {
         status = retransformPass(jvmti, virtualThreadClass, HOOK_PHASE_APPLY);
     }
     if (status == SUCCESS && !classDataApplied) {
         status = TRANSFORM_FAILED;
     }
+    free(capturedClassData);
+    capturedClassData = NULL;
+    capturedClassDataLength = 0;
     if (status == SUCCESS && injectInitializationFault("retransform")) {
         status = RETRANSFORM_FAILED;
     }
